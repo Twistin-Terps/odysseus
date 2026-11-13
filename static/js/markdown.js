@@ -465,6 +465,24 @@ function _isDangerousSrcset(value) {
   return String(value || '').split(',').some(candidate => _isDangerousUrl(candidate));
 }
 
+// A kept `style` must not lift an element out of the message flow: a
+// `position:fixed;inset:0;opacity:0` link would cover the whole app and
+// hijack the next click. Refuse any position other than static/relative, and
+// any backslash (CSS escape, e.g. `\70 osition`) or comment opener
+// (`pos/**/ition`) that could hide a declaration from this text check.
+const _SAFE_CSS_POSITIONS = new Set(['static', 'relative']);
+
+function _isOverlayStyle(value) {
+  const css = String(value || '');
+  if (css.includes('\\') || css.includes('/*')) return true;
+  const decl = /(?:^|;)\s*position\s*:\s*([^;]*)/gi;
+  let m;
+  while ((m = decl.exec(css)) !== null) {
+    if (!_SAFE_CSS_POSITIONS.has(m[1].trim().toLowerCase())) return true;
+  }
+  return false;
+}
+
 function _cleanAllowedHtmlOnce(htmlString) {
   const tpl = document.createElement('template');
   tpl.innerHTML = htmlString;
@@ -486,7 +504,9 @@ function _cleanAllowedHtmlOnce(htmlString) {
       }
       if (name === 'style') {
         const value = _compactUrlSchemeValue(attr.value);
-        if (/javascript:|vbscript:|data:|expression\(/.test(value)) {
+        if (/javascript:|vbscript:|data:|expression\(/.test(value)
+            || _isOverlayStyle(attr.value)
+            || (el.style && el.style.position && !_SAFE_CSS_POSITIONS.has(el.style.position.toLowerCase()))) {
           el.removeAttribute(attr.name);
         }
         continue;
