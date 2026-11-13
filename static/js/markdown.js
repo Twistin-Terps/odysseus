@@ -513,7 +513,10 @@ function _getAttr(el, name) {
   return attr ? attr.value : null;
 }
 
-function _cleanAllowedHtmlOnce(htmlString) {
+// keepRemoteMedia (document editor only): skip the three remote-fetch rules
+// below (remote <img> placeholder, fetch-attribute removal, fetching-style
+// removal) so user-inserted remote images round-trip. Every other rule applies.
+function _cleanAllowedHtmlOnce(htmlString, keepRemoteMedia) {
   const tpl = document.createElement('template');
   tpl.innerHTML = htmlString;
   for (const el of Array.from(tpl.content.querySelectorAll('*'))) {
@@ -527,7 +530,7 @@ function _cleanAllowedHtmlOnce(htmlString) {
     }
     // A remote <img> becomes the same click-to-load placeholder a remote
     // markdown image gets. (A dangerous-scheme src is dropped below instead.)
-    if (tag === 'IMG') {
+    if (tag === 'IMG' && !keepRemoteMedia) {
       const src = _getAttr(el, 'src');
       if (src !== null && !_isDangerousUrl(src) && !_isSameOriginFetchUrlText(src)) {
         const swap = document.createElement('template');
@@ -547,7 +550,10 @@ function _cleanAllowedHtmlOnce(htmlString) {
       if (name === 'style') {
         const value = _compactUrlSchemeValue(attr.value);
         // url( / image-set( / src( would fetch on render (any property).
-        if (/javascript:|vbscript:|data:|expression\(|url\(|image-set\(|src\(/.test(value)
+        const fetchRe = keepRemoteMedia
+          ? /javascript:|vbscript:|data:|expression\(/
+          : /javascript:|vbscript:|data:|expression\(|url\(|image-set\(|src\(/;
+        if (fetchRe.test(value)
             || _isOverlayStyle(attr.value)
             || (el.style && el.style.position && !_SAFE_CSS_POSITIONS.has(el.style.position.toLowerCase()))) {
           el.removeAttribute(attr.name);
@@ -555,11 +561,12 @@ function _cleanAllowedHtmlOnce(htmlString) {
         continue;
       }
       // srcset (<img>/<source>) is never kept: each candidate would fetch.
-      if (name === 'srcset') {
+      if (name === 'srcset' && !keepRemoteMedia) {
         el.removeAttribute(attr.name);
         continue;
       }
-      if ((_ALLOWED_HTML_FETCH_ATTRS.has(name)
+      if (!keepRemoteMedia
+          && (_ALLOWED_HTML_FETCH_ATTRS.has(name)
            || ((name === 'href' || name === 'xlink:href') && tag !== 'A'))
           && !_isSameOriginFetchUrlText(attr.value)) {
         el.removeAttribute(attr.name);
@@ -577,7 +584,10 @@ function _cleanAllowedHtmlOnce(htmlString) {
   return tpl.innerHTML;
 }
 
-export function sanitizeAllowedHtml(html) {
+// Default is the strict chat behaviour. Only the document editor's load
+// paths pass { keepRemoteMedia: true } (see _cleanAllowedHtmlOnce).
+export function sanitizeAllowedHtml(html, options) {
+  const keepRemoteMedia = !!(options && options.keepRemoteMedia === true);
   const raw = String(html == null ? '' : html);
   // Non-browser context (e.g. a future SSR/Node import): fail closed by
   // escaping rather than trusting the markup.
@@ -587,7 +597,7 @@ export function sanitizeAllowedHtml(html) {
   // tree (the basis of mutation-XSS), so re-clean until it stops changing.
   let out = raw;
   for (let i = 0; i < 4; i++) {
-    const next = _cleanAllowedHtmlOnce(out);
+    const next = _cleanAllowedHtmlOnce(out, keepRemoteMedia);
     if (next === out) break;
     out = next;
   }

@@ -3567,7 +3567,7 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
     if (!text && !rich.querySelector('img, hr, table')) return '';
     const html = rich.innerHTML || '';
     const sanitized = markdownModule.sanitizeAllowedHtml
-      ? markdownModule.sanitizeAllowedHtml(html)
+      ? markdownModule.sanitizeAllowedHtml(html, { keepRemoteMedia: true })
       : html;
     const tpl = document.createElement('template');
     tpl.innerHTML = sanitized;
@@ -3599,7 +3599,7 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
     if (!raw.trim()) return '';
     if (/<\/?[a-z][^>]*>/i.test(raw)) {
       return markdownModule.sanitizeAllowedHtml
-        ? markdownModule.sanitizeAllowedHtml(raw)
+        ? markdownModule.sanitizeAllowedHtml(raw, { keepRemoteMedia: true })
         : raw;
     }
     try { return markdownModule.mdToHtml(raw, { shortcodes: false }); }
@@ -3620,7 +3620,7 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
     // rich body often starts with plain text, e.g. "Hi <b>there</b>".)
     if (/<\/?(b|i|u|s|strong|em|del|strike|a|p|div|br|ul|ol|li|h[1-3]|blockquote|span|code|pre)\b[^>]*>/i.test(t)) {
       return markdownModule.sanitizeAllowedHtml
-        ? markdownModule.sanitizeAllowedHtml(t)
+        ? markdownModule.sanitizeAllowedHtml(t, { keepRemoteMedia: true })
         : _emailPlainTextToHtml(t);
     }
     // Email body: keep author-typed `:shortcode:` text literal. Issue #345
@@ -3636,7 +3636,7 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
       const t = raw.trim();
       if (/<\/?(b|i|u|s|strong|em|del|strike|a|p|div|br|ul|ol|li|h[1-3]|blockquote|span|code|pre)\b[^>]*>/i.test(t)) {
         return markdownModule.sanitizeAllowedHtml
-          ? markdownModule.sanitizeAllowedHtml(t)
+          ? markdownModule.sanitizeAllowedHtml(t, { keepRemoteMedia: true })
           : _emailPlainTextToHtml(t);
       }
       return _emailBodyFragmentToHtml(raw);
@@ -16162,7 +16162,7 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
       const richMode = _isRichTextLang(document.getElementById('doc-language-select')?.value || '');
       if (richMode) {
         const safe = markdownModule?.sanitizeAllowedHtml
-          ? markdownModule.sanitizeAllowedHtml(md)
+          ? markdownModule.sanitizeAllowedHtml(md, { keepRemoteMedia: true })
           : md;
         preview.classList.add('doc-rich-preview');
         preview.innerHTML = safe || '<p class="doc-rich-preview-empty">No preview yet.</p>';
@@ -16247,7 +16247,7 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
       if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
       const raw = String(payload.html || '');
       const safe = markdownModule.sanitizeAllowedHtml
-        ? markdownModule.sanitizeAllowedHtml(raw)
+        ? markdownModule.sanitizeAllowedHtml(raw, { keepRemoteMedia: true })
         : _escHtml(raw);
       preview.innerHTML = `<article class="doc-docx-paper">${safe || '<p>No preview content.</p>'}</article>`;
       if (remember && activeDocId && docs.has(activeDocId)) docs.get(activeDocId)._docxPreviewActive = true;

@@ -270,3 +270,94 @@ def test_same_origin_and_click_only_content_is_kept(node_available):
     assert '<a href="https://example.org">site</a>' in link, link
     assert '<div style="color:red">x</div>' in styled, styled
     assert '<video src="/api/files/v.mp4" poster="/api/files/p.png"></video>' in media, media
+
+
+# --- Document-editor opt-out -------------------------------------------------
+# The document editor (static/js/document.js) loads saved rich-text documents
+# and email bodies through sanitizeAllowedHtml. Users insert remote images
+# there, so its load paths pass { keepRemoteMedia: true }: the three
+# remote-fetch rules above are skipped and the images round-trip, while every
+# older protection still applies. The default stays strict.
+
+_SANITIZE_SCRIPT = _SCRIPT.replace(
+    "console.log(JSON.stringify(inputs.map(input => mod.mdToHtml(input))));",
+    "console.log(JSON.stringify(inputs.map(([html, opts]) =>"
+    " opts === null ? mod.sanitizeAllowedHtml(html) : mod.sanitizeAllowedHtml(html, opts))));",
+)
+assert _SANITIZE_SCRIPT != _SCRIPT
+
+_KEEP = {"keepRemoteMedia": True}
+
+
+def _sanitize_all(pairs):
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", _SANITIZE_SCRIPT, json.dumps(pairs)],
+        cwd=_REPO, capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"node failed:\nSTDERR:\n{result.stderr}\nSTDOUT:\n{result.stdout}")
+    return json.loads(result.stdout.splitlines()[-1])
+
+
+def test_editor_opt_out_keeps_remote_media(node_available):
+    img, video, styled = _sanitize_all([
+        ['<img src="https://example.org/a.png" alt="x">', _KEEP],
+        ['<video poster="https://example.org/p.png"></video>', _KEEP],
+        ['<div style="background:url(\'https://example.org/b.png\')">x</div>', _KEEP],
+    ])
+    assert '<img src="https://example.org/a.png" alt="x">' in img, img
+    assert _PLACEHOLDER not in img, img
+    assert '<video poster="https://example.org/p.png"></video>' in video, video
+    assert "style=" in styled and "example.org/b.png" in styled, styled
+
+
+def test_editor_opt_out_keeps_older_protections(node_available):
+    handler, overlay, script, js_src = _sanitize_all([
+        ['<img src="x" onerror="alert(1)">', _KEEP],
+        ['<a style="position:fixed;inset:0">x</a>', _KEEP],
+        ['a<script>alert(1)</script>b', _KEEP],
+        ['<img src="javascript:alert(1)">', _KEEP],
+    ])
+    assert "onerror" not in handler, handler
+    assert "<img" in handler, handler
+    assert "style" not in overlay, overlay
+    assert "<script" not in script and "alert" not in script, script
+    assert "javascript:" not in js_src, js_src
+
+
+def test_default_and_falsy_option_stay_strict(node_available):
+    outputs = _sanitize_all([
+        ['<img src="https://example.org/a.png" alt="x">', None],
+        ['<img src="https://example.org/a.png" alt="x">', {}],
+        ['<img src="https://example.org/a.png" alt="x">', {"keepRemoteMedia": "yes"}],
+    ])
+    for html in outputs:
+        assert _PLACEHOLDER in html, html
+        assert "<img" not in html, html
+
+
+# Every sanitizeAllowedHtml call in the editor opts out except the paste
+# cleaner: the four load paths plus the rich preview and the DOCX preview.
+_EDITOR_LOAD_FUNCS = (
+    "_sanitizedRichTextHtml",
+    "_richTextContentToHtml",
+    "_emailBodyFragmentToHtml",
+    "_emailBodyToHtml",
+    "_setMarkdownPreviewActive",
+    "_setDocxPreviewActive",
+)
+
+
+def test_document_editor_call_sites_pass_the_opt_out():
+    from tests.helpers.document_source import document_source, function_body
+
+    for name in _EDITOR_LOAD_FUNCS:
+        calls = re.findall(r"sanitizeAllowedHtml\(([^)]*)\)", function_body(name))
+        assert calls, name
+        for args in calls:
+            assert re.search(r",\s*\{\s*keepRemoteMedia:\s*true\s*\}", args), (name, args)
+    paste = re.findall(r"sanitizeAllowedHtml\(([^;]*?)\)\s*\n", function_body("_cleanRichTextPasteHtml"))
+    assert paste, "paste cleaner call not found"
+    assert all("keepRemoteMedia" not in args for args in paste), paste
+    # Exactly the six calls above opt out, nothing else in the editor.
+    assert document_source().count("keepRemoteMedia") == 6
