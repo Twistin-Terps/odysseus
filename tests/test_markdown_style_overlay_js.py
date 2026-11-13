@@ -161,12 +161,15 @@ _REFUSED = [
     "color:red; position:sticky",
     r"\70 osition:fixed",
     "pos/**/ition:fixed",
+    "@x{}position:fixed",
+    "@media all{}position:absolute",
 ]
 
 _KEPT = [
     "color:red",
     "text-align:center; font-weight:bold",
     "position:relative",
+    "background-position:center",
 ]
 
 

