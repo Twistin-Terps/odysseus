@@ -71,10 +71,17 @@ def _safe_link_url(url) -> str:
         return ""
     cleaned = _URL_INNER_IGNORED_RE.sub("", url.strip(_URL_STRIP_CHARS))
     try:
-        scheme = urlparse(cleaned).scheme.lower()
+        parsed = urlparse(cleaned)
+        scheme = parsed.scheme.lower()
+        if scheme not in ("http", "https"):
+            return ""
+        # Host-less forms (https:/path, http:evil, https:) resolve against the
+        # page's own origin, so require a real host.
+        if not parsed.netloc or not parsed.hostname:
+            return ""
     except ValueError:
         return ""
-    return cleaned if scheme in ("http", "https") else ""
+    return cleaned
 
 
 def _autolink_urls(md_text: str) -> str:
