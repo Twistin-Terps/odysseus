@@ -22,12 +22,16 @@ export const _TALON_ORIG_RE = /(?:^|\n)[\s>]*[-_=]{3,}\s*(?:Original\s+Message|F
 // a click for two bytes of saving.
 export const _SIG_BLOAT_MIN_CHARS = 200;
 
-// HTML-escape a string by round-tripping through a detached div. Cheap
-// and correct (handles all the entities that matter for innerHTML).
+// HTML-escape a string for text AND quoted-attribute contexts: & < > " '.
+// (The old textContent->innerHTML round trip left quotes raw, so email data
+// placed inside attribute="..." could close the attribute.)
 export function _esc(text) {
-  const div = document.createElement('div');
-  div.textContent = text || '';
-  return div.innerHTML;
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 const _EMAIL_SUMMARY_ERROR_MESSAGES = Object.freeze({
