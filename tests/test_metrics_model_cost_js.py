@@ -47,6 +47,14 @@ def _pricing_prelude():
         _block(r"^const _LONG_PROMPT_PRICING = .*?;"),
         _function_source("getModelCost"),
         _function_source("getMetricsModelCost"),
+        _function_source("_backendTurnCost"),
+        # The session-cost path, with the endpoint lookups stubbed: only the
+        # Anthropic URL is a billed route, anything else is local/free.
+        "function _currentEndpointUrl() { return null; }",
+        "function isCostTrackedEndpoint(url) { return url === 'https://api.anthropic.com/v1'; }",
+        _function_source("_isBillableRoute"),
+        _function_source("_billableCost"),
+        _function_source("_metricsBillableCost"),
     ])
 
 
@@ -151,3 +159,95 @@ console.log(JSON.stringify(Object.fromEntries(
     assert {key: out[key] for key in _ONE_MILLION_CONTEXT} == dict.fromkeys(_ONE_MILLION_CONTEXT, 1_000_000)
     for key in ("claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"):
         assert out[key] == 200_000, key
+
+
+# A billed round on a model missing from MODEL_INFO can't be priced in the
+# browser. The backend still sends its cost for the turn (cost_usd, estimated
+# or provider-reported); using it keeps the browser from silently dropping
+# that round and showing a lower cost than the one stored for the turn.
+_KNOWN = "{model: 'claude-sonnet-4-5', input_tokens: 10000, output_tokens: 100}"
+_UNKNOWN = "{model: 'mystery-model', input_tokens: 10000, output_tokens: 100}"
+_KNOWN_COST = (3.00 * 10_000 + 15.00 * 100) / 1_000_000
+
+
+def test_compare_cost_uses_backend_cost_when_a_round_is_unpriced():
+    out = _run(f"""
+console.log(JSON.stringify({{
+  mixed: getMetricsModelCost({{usage_buckets: [{_KNOWN}, {_UNKNOWN}], cost_usd: 0.5}}, ''),
+  noBackend: getMetricsModelCost({{usage_buckets: [{_KNOWN}, {_UNKNOWN}]}}, ''),
+  nullBackend: getMetricsModelCost({{usage_buckets: [{_UNKNOWN}], cost_usd: null}}, ''),
+  single: getMetricsModelCost({{model: 'mystery-model', input_tokens: 5, output_tokens: 1, cost_usd: 0.2}}, ''),
+  allKnown: getMetricsModelCost({{usage_buckets: [{_KNOWN}], cost_usd: 9}}, ''),
+}}));
+""")
+    assert out["mixed"] == pytest.approx(0.5)
+    assert out["noBackend"] == pytest.approx(_KNOWN_COST)  # nothing better to show
+    assert out["nullBackend"] is None  # a missing backend cost is not $0
+    assert out["single"] == pytest.approx(0.2)
+    assert out["allKnown"] == pytest.approx(_KNOWN_COST)  # fully priced: unchanged
+
+
+def test_session_cost_uses_backend_cost_only_for_billed_unpriced_rounds():
+    paid = "endpoint_cost_tracked: true"
+    free = "endpoint_cost_tracked: false"
+    out = _run(f"""
+const known = {_KNOWN}, unknown = {_UNKNOWN};
+const at = (b, flag) => ({{...b, ...flag}});
+console.log(JSON.stringify({{
+  billedUnknown: _metricsBillableCost(
+    {{usage_buckets: [at(known, {{{paid}}}), at(unknown, {{{paid}}})], cost_usd: 0.5}}, '', 0, 0, null),
+  freeUnknown: _metricsBillableCost(
+    {{usage_buckets: [at(known, {{{paid}}}), at(unknown, {{{free}}})], cost_usd: 0.5}}, '', 0, 0, null),
+  allFree: _metricsBillableCost(
+    {{usage_buckets: [at(unknown, {{{free}}})], cost_usd: 0.5}}, '', 0, 0, null),
+  singleBilledUnknown: _metricsBillableCost(
+    {{model: 'mystery-model', {paid}, cost_usd: 0.3}}, 'mystery-model', 5, 1, null),
+  singleFree: _metricsBillableCost(
+    {{model: 'mystery-model', {free}, cost_usd: 0.3}}, 'mystery-model', 5, 1, null),
+}}));
+""")
+    assert out["billedUnknown"] == pytest.approx(0.5)
+    # A free (local/subscription) round costs nothing; it is not "unpriced".
+    assert out["freeUnknown"] == pytest.approx(_KNOWN_COST)
+    assert out["allFree"] is None
+    assert out["singleBilledUnknown"] == pytest.approx(0.3)
+    assert out["singleFree"] is None
+
+
+def _js_tables():
+    return _run("""
+console.log(JSON.stringify({
+  prices: Object.fromEntries(Object.entries(MODEL_INFO).map(([key, info]) => [key, [info.input, info.output]])),
+  ctx: Object.fromEntries(Object.entries(MODEL_INFO).map(([key, info]) => [key, info.ctx ?? null])),
+  cacheWrite: _CLAUDE_CACHE_WRITE_MULT,
+  cacheRead: _CLAUDE_CACHE_READ_MULT,
+  longPrompt: _LONG_PROMPT_PRICING,
+}));
+""")
+
+
+def test_price_tables_match_src_model_pricing():
+    # The webui keeps its own copy of the price table (chatRenderer.js has no
+    # backend round trip for session cost); both copies are edited by hand, so
+    # a price changed in one must fail here until the other matches.
+    from src import model_pricing
+
+    out = _js_tables()
+    assert out["prices"] == {key: list(price) for key, price in model_pricing.MODEL_PRICING.items()}
+    assert out["cacheWrite"] == model_pricing._ANTHROPIC_CACHE_WRITE_MULT
+    assert out["cacheRead"] == model_pricing._ANTHROPIC_CACHE_READ_MULT
+    assert out["longPrompt"] == {
+        key: [threshold, price_in, price_out]
+        for key, (threshold, (price_in, price_out)) in model_pricing._LONG_PROMPT_PRICING.items()
+    }
+
+
+def test_claude_context_windows_match_src_model_context():
+    # The model info popup's Claude windows must agree with the server's
+    # known-windows lookup, which context % is computed from.
+    from src.model_context import _lookup_known
+
+    out = _js_tables()
+    claude = {key: ctx for key, ctx in out["ctx"].items() if key.startswith("claude-")}
+    assert claude, "no Claude rows found in MODEL_INFO"
+    assert claude == {key: _lookup_known(key) for key in claude}
