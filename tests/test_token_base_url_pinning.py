@@ -191,3 +191,35 @@ def test_resumed_server_chosen_endpoint_is_not_blocked(
 
     assert r.status_code == 503, r.text
     assert expected_host in connects
+
+
+@pytest.mark.parametrize("base_url", [
+    "https://llm.example.test/v1?api-version=secret-q",
+    "https://llm.example.test/v1#frag",
+    "https://llm.example.test#@127.0.0.1/",
+])
+def test_token_base_url_with_query_or_fragment_is_400_not_500(monkeypatch, connects, base_url):
+    client = _client(monkeypatch, _SessionManager())
+
+    r = client.post("/api/v1/chat", json={
+        "message": "hello",
+        "api_key": "token-supplied-key",
+        "base_url": base_url,
+        "model": "pin-test-unlisted-model",
+    })
+
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"] == "base_url must not include a query string or fragment"
+    assert "secret-q" not in r.text and "127.0.0.1" not in r.text
+    assert connects == []
+
+
+def test_resumed_session_url_with_query_is_400(monkeypatch, connects):
+    sess = _Session("https://llm.example.test/v1/chat/completions?x=1", "pin-test-unlisted-model")
+    client = _client(monkeypatch, _SessionManager({"s1": sess}))
+
+    r = client.post("/api/v1/chat", json={"message": "hello", "session": "s1"})
+
+    assert r.status_code == 400, r.text
+    assert connects == []
+    assert sess.history == []
