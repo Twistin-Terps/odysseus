@@ -265,3 +265,40 @@ def test_ai_reply_makes_no_call_when_trust_lookup_raises(db, monkeypatch):
     assert calls == []
     # The session URL is dropped and no fallback endpoint is configured.
     assert result == {"success": False, "error": "No LLM endpoint configured"}
+
+
+# --- the chat URL the server builds is trusted (Tailscale host) --------------
+
+TAILSCALE_BASE = "http://gpubox:8080/v1"
+
+
+@pytest.fixture
+def tailscale_gpubox(monkeypatch):
+    """gpubox has no DNS entry; `tailscale status` maps it to 100.100.1.5."""
+    import json
+    import socket
+    import types
+
+    from src import endpoint_resolver as er
+
+    def _no_dns(*a, **k):
+        raise socket.gaierror("no DNS")
+
+    peers = {"Peer": {"x": {"HostName": "gpubox", "DNSName": "gpubox.tail.ts.net.",
+                            "TailscaleIPs": ["100.100.1.5"]}}}
+    monkeypatch.setattr(er, "_tailscale_cache", {})
+    monkeypatch.setattr(er.socket, "getaddrinfo", _no_dns)
+    monkeypatch.setattr(er.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=json.dumps(peers)))
+    return er
+
+
+def test_server_built_chat_url_on_tailscale_host_is_trusted(tailscale_gpubox):
+    built = tailscale_gpubox.build_chat_url(TAILSCALE_BASE)
+    assert built == "http://100.100.1.5:8080/v1/chat/completions"
+    assert trust.session_url_matches_endpoint(built, TAILSCALE_BASE) is True
+
+
+def test_other_address_on_same_port_and_path_is_not_trusted(tailscale_gpubox):
+    assert trust.session_url_matches_endpoint(
+        "http://100.100.1.6:8080/v1/chat/completions", TAILSCALE_BASE) is False

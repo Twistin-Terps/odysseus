@@ -96,9 +96,17 @@ def session_url_matches_endpoint(session_url: str, endpoint_base: str) -> bool:
     if not session_url or not endpoint_base:
         return False
     try:
-        sess = _session_identity(session_url.strip())
         base = _base_identity(normalize_base(endpoint_base))
-        if sess is None or base is None:
+        if base is None:
+            return False
+        # The chat URL the server itself builds for this endpoint is trusted
+        # as is: build_chat_url may swap the host for its Tailscale address,
+        # so this exact comparison must run before the origin check.
+        built = build_chat_url(normalize_base(endpoint_base)).rstrip("/")
+        if session_url.strip().rstrip("/") == built:
+            return True
+        sess = _session_identity(session_url.strip())
+        if sess is None:
             return False
         origin, base_path = base
         if sess[0] != origin:
