@@ -232,3 +232,88 @@ def test_chat_orphan_check_normal_cases_unchanged(db):
     orphan = _session(UNTRUSTED)
     assert chat_routes._clear_orphaned_session_endpoint(orphan, OWNER) is True
     assert orphan.endpoint_url == "" and orphan.model == ""
+
+
+# ---------------------------------------------------------------- compact
+
+UTILITY = "http://192.168.1.60:8080/v1/chat/completions"
+
+
+def _compact(monkeypatch, db, route, sess, llm, utility=False):
+    """POST /session/{id}/compact (session_routes) or /api/session/{id}/compact
+    (history_routes). The resolver returns the fallback (no utility endpoint)
+    unless ``utility`` is set."""
+    import src.agent_runs as agent_runs
+    import src.endpoint_resolver as endpoint_resolver
+    import src.llm_core as llm_core
+    from core.models import ChatMessage
+
+    sess.history = [ChatMessage(role="user" if i % 2 == 0 else "assistant", content=f"m{i}") for i in range(10)]
+    sess.message_count = len(sess.history)
+
+    def fake_resolve(kind, fallback_url=None, fallback_model=None, fallback_headers=None, owner=None):
+        if utility:
+            return UTILITY, "util-model", {}
+        return fallback_url, fallback_model, fallback_headers
+
+    monkeypatch.setattr(agent_runs, "is_active", lambda session_id: False)
+    monkeypatch.setattr(endpoint_resolver, "resolve_endpoint", fake_resolve)
+    monkeypatch.setattr(llm_core, "llm_call_async", llm)
+    manager = _Manager(sess)
+    manager.replace_messages = lambda sid, msgs: True
+    if route == "session":
+        monkeypatch.setattr(session_routes, "_verify_session_owner", lambda *a, **k: None)
+        monkeypatch.setattr(session_routes, "effective_user", lambda request: OWNER)
+        monkeypatch.setattr(session_routes, "router", APIRouter(prefix="/api"))
+        router = session_routes.setup_session_routes(manager, {})
+        endpoint = _endpoint(router, "/api/session/{session_id}/compact")
+    else:
+        monkeypatch.setattr(history_routes, "_verify_session_owner", lambda *a, **k: None)
+        monkeypatch.setattr(history_routes, "SessionLocal", db)
+        with db() as s:
+            s.add(cdb.Session(id="s1", name="t", owner=OWNER, endpoint_url=sess.endpoint_url, model=KNOWN_MODEL))
+            s.commit()
+        router = history_routes.setup_history_routes(manager)
+        endpoint = _endpoint(router, "/api/session/{session_id}/compact")
+    return asyncio.run(endpoint(_request(), "s1"))
+
+
+def _recorder(calls):
+    async def llm(url, model, messages, **kwargs):
+        calls.append(url)
+        return "Summary"
+    return llm
+
+
+async def _forbidden_async(*args, **kwargs):
+    raise AssertionError("outbound request made to an untrusted session URL")
+
+
+@pytest.mark.parametrize("route", ["session", "history"])
+def test_compact_refuses_untrusted_session_url(db, monkeypatch, route):
+    monkeypatch.setattr(model_context, "get_context_length", _forbidden)
+    monkeypatch.setattr(model_context.httpx, "get", _forbidden)
+    with pytest.raises(HTTPException) as exc:
+        _compact(monkeypatch, db, route, _session(UNTRUSTED), _forbidden_async)
+    assert exc.value.status_code == 400
+    assert exc.value.detail == trust.UNTRUSTED_ENDPOINT_MESSAGE
+    assert "rebind" not in exc.value.detail
+
+
+@pytest.mark.parametrize("route", ["session", "history"])
+def test_compact_still_works_for_owner_visible_endpoint(db, monkeypatch, route):
+    calls = []
+    monkeypatch.setattr(model_context, "get_context_length", lambda u, m: 4242)
+    _compact(monkeypatch, db, route, _session(CONFIGURED), _recorder(calls))
+    assert calls == [CONFIGURED]
+
+
+@pytest.mark.parametrize("route", ["session", "history"])
+def test_compact_with_utility_endpoint_ignores_untrusted_session_url(db, monkeypatch, route):
+    """The session URL is never used when a utility endpoint resolves, so it
+    does not block compaction (and the history route does not probe it)."""
+    calls = []
+    monkeypatch.setattr(model_context, "get_context_length", _forbidden)
+    monkeypatch.setattr(model_context.httpx, "get", _forbidden)
+    _compact(monkeypatch, db, route, _session(UNTRUSTED), _recorder(calls), utility=True)
+    assert calls == [UTILITY]

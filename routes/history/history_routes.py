@@ -1163,7 +1163,33 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
             if len(session.history) < 6:
                 return {"status": "ok", "message": "Not enough messages to compact"}
 
-            ctx_len = get_context_length(session.endpoint_url, session.model)
+            # Use utility model if available
+            from src.utility_effort import effort_for_call
+            util_url, util_model, util_headers = resolve_endpoint(
+                "utility",
+                fallback_url=getattr(session, "endpoint_url", None),
+                fallback_model=getattr(session, "model", None),
+                fallback_headers=getattr(session, "headers", None),
+                owner=owner or None,
+            )
+            compact_url = util_url or session.endpoint_url
+            compact_model = util_model or session.model
+            compact_headers = util_headers if util_url else session.headers
+
+            from src.session_endpoint_trust import (
+                UNTRUSTED_ENDPOINT_MESSAGE, known_context_length, session_endpoint_is_trusted,
+            )
+            trust_owner = getattr(session, "owner", None) or owner
+            session_trusted = session_endpoint_is_trusted(session, trust_owner)
+            if not session_trusted and compact_url and compact_url == (session.endpoint_url or ""):
+                # Untrusted stored URL: refuse before any outbound request.
+                raise HTTPException(400, UNTRUSTED_ENDPOINT_MESSAGE)
+
+            if session_trusted:
+                ctx_len = get_context_length(session.endpoint_url, session.model)
+            else:
+                # Untrusted stored URL: table value only, never probe it.
+                ctx_len = known_context_length(session.model)
             messages_before = session.get_context_messages()
             used_before = estimate_tokens(messages_before)
             pct_before = round((used_before / ctx_len) * 100, 1) if ctx_len else 0
@@ -1180,19 +1206,6 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
                 f"{_message_text(m)[:2000]}"
                 for m in older
             )
-
-            # Use utility model if available
-            from src.utility_effort import effort_for_call
-            util_url, util_model, util_headers = resolve_endpoint(
-                "utility",
-                fallback_url=getattr(session, "endpoint_url", None),
-                fallback_model=getattr(session, "model", None),
-                fallback_headers=getattr(session, "headers", None),
-                owner=owner or None,
-            )
-            compact_url = util_url or session.endpoint_url
-            compact_model = util_model or session.model
-            compact_headers = util_headers if util_url else session.headers
 
             from src.context_compactor import SELF_SUMMARY_SYSTEM_PROMPT, normalize_compaction_summary
             compaction_count = sum(1 for m in session.history if isinstance(m, ChatMessage) and "[Conversation summary" in (m.content or ""))
@@ -1283,6 +1296,8 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
                 "after": pct_after,
             }
 
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Manual compact error {session_id}: {e}")
             raise HTTPException(500, str(e))

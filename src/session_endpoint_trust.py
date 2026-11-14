@@ -104,6 +104,15 @@ def session_endpoint_is_trusted(sess, owner: str | None) -> bool:
             db.close()
 
 
+def uses_untrusted_session_url(url: str | None, sess, owner: str | None) -> bool:
+    """True when ``url`` is the session's own stored URL and that URL is not
+    trusted, i.e. the caller must refuse instead of contacting it."""
+    stored = getattr(sess, "endpoint_url", "") or ""
+    if not url or not stored or url != stored:
+        return False
+    return not session_endpoint_is_trusted(sess, owner)
+
+
 def known_context_length(model: str) -> int:
     """Context window from the built-in table only, with no network probe."""
     from src.model_context import DEFAULT_CONTEXT, _lookup_known

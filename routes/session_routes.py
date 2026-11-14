@@ -1254,6 +1254,9 @@ def setup_session_routes(
             url, model, headers = session.endpoint_url, session.model, session.headers
         if not url or not model:
             raise HTTPException(400, "No model configured for compaction")
+        from src.session_endpoint_trust import UNTRUSTED_ENDPOINT_MESSAGE, uses_untrusted_session_url
+        if uses_untrusted_session_url(url, session, owner):
+            raise HTTPException(400, UNTRUSTED_ENDPOINT_MESSAGE)
 
         prior_compactions = sum(
             1 for m in history
