@@ -321,11 +321,12 @@ def setup_task_routes(task_scheduler) -> APIRouter:
                 return prompt[:50].strip()
             db = SessionLocal()
             try:
-                candidates = db.query(DbSession).filter(
+                q = db.query(DbSession).filter(
                     DbSession.endpoint_url.isnot(None),
                     DbSession.model.isnot(None),
-                    DbSession.owner == owner,
-                ).order_by(DbSession.created_at.desc()).limit(20).all()
+                )
+                q = q.filter(DbSession.owner == owner)
+                candidates = q.order_by(DbSession.created_at.desc()).limit(20).all()
                 # Only a URL the server chose (built-in provider or a visible
                 # enabled ModelEndpoint); a token-created session's URL is not
                 # re-validated here.
