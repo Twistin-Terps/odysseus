@@ -219,3 +219,49 @@ async def test_task_name_with_empty_owner_uses_no_session(task_routes_db, db, mo
     created, calls = await _create_named_task(task_routes_db, monkeypatch, user, "Summarize the weekly report")
     assert calls == []
     assert created["name"] == "Summarize the weekly report"
+
+
+# --- email ai-reply fails closed when the trust lookup raises ----------------
+
+UNTRUSTED = "https://rebind.example.test/v1/chat/completions"
+
+
+def test_ai_reply_makes_no_call_when_trust_lookup_raises(db, monkeypatch):
+    import asyncio
+
+    import routes.email.email_routes as email_routes
+    import src.endpoint_resolver as endpoint_resolver
+    import src.llm_core as llm_core
+
+    monkeypatch.setattr(cdb, "SessionLocal", db)
+    with db() as s:
+        s.add(cdb.Session(id="s1", name="t", owner=OWNER, endpoint_url=UNTRUSTED, model="gpt-4o"))
+        s.commit()
+    monkeypatch.setattr(email_routes, "_load_settings", lambda: {})
+    monkeypatch.setattr(email_routes, "_get_email_writing_style_for_account", lambda settings, account_id: "")
+
+    def broken_lookup(*args, **kwargs):
+        raise RuntimeError("trust lookup failed")
+
+    monkeypatch.setattr(trust, "uses_untrusted_session_url", broken_lookup)
+    monkeypatch.setattr(endpoint_resolver, "resolve_endpoint", lambda *a, **k: (None, None, None))
+    calls = []
+
+    def record(*args, **kwargs):
+        calls.append(("list_model_ids", args))
+        return []
+
+    async def record_async(*args, **kwargs):
+        calls.append(("llm", args, kwargs.get("url")))
+        return ""
+
+    monkeypatch.setattr(llm_core, "list_model_ids", record)
+    monkeypatch.setattr(llm_core, "llm_call_async_with_fallback", record_async)
+    monkeypatch.setattr(llm_core, "llm_call_async", record_async)
+    router = email_routes.setup_email_routes()
+    reply = next(r.endpoint for r in router.routes if r.path == "/api/email/ai-reply")
+    result = asyncio.run(reply({"original_body": "Hello there", "session_id": "s1", "fast": True}, owner=OWNER))
+
+    assert calls == []
+    # The session URL is dropped and no fallback endpoint is configured.
+    assert result == {"success": False, "error": "No LLM endpoint configured"}

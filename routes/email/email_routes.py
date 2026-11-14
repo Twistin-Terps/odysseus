@@ -6945,33 +6945,41 @@ def setup_email_routes():
                     # chat-completions URL the chat path uses verbatim — so use
                     # those directly rather than rebuilding via a nonexistent
                     # `api_key` field.
+                    # Fail closed: url/headers/model take the session's values
+                    # only after the trust guard below has passed, so an
+                    # exception anywhere in this block leaves url empty.
                     from core.database import SessionLocal as _SL, Session as _CS
+                    _s_url, _s_headers, _s_model = None, None, model
                     _db = _SL()
-                    sess = _db.query(_CS).filter(_CS.id == session_id, _CS.owner == owner).first()
-                    if sess and sess.endpoint_url:
-                        url = sess.endpoint_url
-                        # Some sessions stored headers double-encoded (a JSON
-                        # string inside the JSON column), so the ORM hands back
-                        # a str, not a dict — and llm_call_async's h.update()
-                        # then throws "dictionary update sequence element…".
-                        # Unwrap until we have a dict (or give up → no headers).
-                        _h = sess.headers
-                        for _ in range(3):
-                            if isinstance(_h, str):
-                                try:
-                                    _h = json.loads(_h)
-                                except Exception:
-                                    _h = None
+                    try:
+                        sess = _db.query(_CS).filter(_CS.id == session_id, _CS.owner == owner).first()
+                        if sess and sess.endpoint_url:
+                            _s_url = sess.endpoint_url
+                            # Some sessions stored headers double-encoded (a JSON
+                            # string inside the JSON column), so the ORM hands back
+                            # a str, not a dict — and llm_call_async's h.update()
+                            # then throws "dictionary update sequence element…".
+                            # Unwrap until we have a dict (or give up → no headers).
+                            _h = sess.headers
+                            for _ in range(3):
+                                if isinstance(_h, str):
+                                    try:
+                                        _h = json.loads(_h)
+                                    except Exception:
+                                        _h = None
+                                        break
+                                else:
                                     break
-                            else:
-                                break
-                        headers = _h if isinstance(_h, dict) and _h else None
-                        if not requested_model:
-                            model = sess.model
-                    _db.close()
+                            _s_headers = _h if isinstance(_h, dict) and _h else None
+                            if not requested_model:
+                                _s_model = sess.model
+                    finally:
+                        _db.close()
                     from src.session_endpoint_trust import UNTRUSTED_ENDPOINT_MESSAGE, uses_untrusted_session_url
-                    if uses_untrusted_session_url(url, sess, owner):
+                    if uses_untrusted_session_url(_s_url, sess, owner):
                         return {"success": False, "error": UNTRUSTED_ENDPOINT_MESSAGE}
+                    if _s_url:
+                        url, headers, model = _s_url, _s_headers, _s_model
                 except Exception as e:
                     logger.warning(f"Failed to read session endpoint: {e}")
 
