@@ -18,6 +18,7 @@ import httpcore
 import httpx
 
 from src.constants import WEB_FETCH_HARD_MAX_BYTES, WEB_FETCH_SOFT_MAX_BYTES
+from src.url_security import is_blocked_ip
 
 
 _PRIVATE_NETWORKS = (
@@ -39,6 +40,10 @@ _PRIVATE_NETWORKS = (
 
 
 def _is_private_address(addr: ipaddress._BaseAddress) -> bool:
+    # The shared rule (site-local, ISATAP, 6to4, ...) always applies; the
+    # checks below only ever add to it.
+    if is_blocked_ip(addr):
+        return True
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
     return (
