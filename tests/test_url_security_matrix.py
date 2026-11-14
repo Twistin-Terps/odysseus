@@ -284,3 +284,15 @@ def test_plain_authority_still_accepted(resolver, url):
     returned, ips = url_security.resolve_public_http_url(url)
     assert returned == url and ips
     assert url_security.is_public_http_url(url) is True
+
+
+@pytest.mark.parametrize("url", [
+    "https://example.com/v1?x=1",
+    "https://example.com/v1#f",
+])
+def test_query_or_fragment_is_refused_without_resolving(resolver, url):
+    with pytest.raises(ValueError) as exc:
+        url_security.resolve_public_http_url(url)
+    assert str(exc.value) == url_security._HAS_QUERY_OR_FRAGMENT
+    assert url_security.is_public_http_url(url) is False
+    assert resolver.calls == []

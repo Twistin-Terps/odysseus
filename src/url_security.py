@@ -193,14 +193,15 @@ def _check_public_http_url(
         raise ValueError(_NOT_PUBLIC) from None
     if port is not None and not 1 <= port <= 65535:
         raise ValueError(_NOT_PUBLIC)
+    # A base URL gets endpoint paths appended (build_chat_url), which refuses
+    # a query or fragment; refuse it here so it is a 400, not a later 500.
+    # Checked on the raw text: urlparse drops an empty "?" or "#". Checked
+    # before the host is resolved, so a refused URL causes no lookup.
+    if "?" in cleaned or "#" in cleaned:
+        raise ValueError(_HAS_QUERY_OR_FRAGMENT)
     ips = _public_ips_for_host(parsed.hostname)
     if not ips:
         raise ValueError(_NOT_PUBLIC)
-    # A base URL gets endpoint paths appended (build_chat_url), which refuses
-    # a query or fragment; refuse it here so it is a 400, not a later 500.
-    # Checked on the raw text: urlparse drops an empty "?" or "#".
-    if "?" in cleaned or "#" in cleaned:
-        raise ValueError(_HAS_QUERY_OR_FRAGMENT)
     return cleaned, ips
 
 
