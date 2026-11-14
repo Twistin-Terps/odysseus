@@ -74,6 +74,10 @@ def session_matches_visible_endpoint(db, sess, owner: str | None) -> bool:
     if owner:
         from src.auth_helpers import owner_filter
         query = owner_filter(query, ModelEndpoint, owner)
+    else:
+        # No owner: only shared endpoints, the rule sync_chat applies
+        # (routes/webhook/webhook_routes.py). Never another user's private row.
+        query = query.filter(ModelEndpoint.owner == None)  # noqa: E711
     bound_id = getattr(sess, "endpoint_id", None)
     for ep in query.all():
         if bound_id and ep.id != bound_id:
