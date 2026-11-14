@@ -9,6 +9,7 @@ a built-in provider URL, or an enabled ``ModelEndpoint`` the owner can see.
 from __future__ import annotations
 
 import logging
+from urllib.parse import urlsplit
 
 from core.database import ModelEndpoint, SessionLocal
 
@@ -37,20 +38,68 @@ UNTRUSTED_ENDPOINT_MESSAGE = (
 )
 
 
+def _origin(parsed):
+    """(scheme, host, effective port) of an http(s) URL with a host, else None.
+
+    Raises ValueError on an invalid port (urllib does)."""
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").rstrip(".").lower()
+    if scheme not in {"http", "https"} or not host:
+        return None
+    return scheme, host, parsed.port or (443 if scheme == "https" else 80)
+
+
+def _base_identity(url: str):
+    """(origin, path) of an endpoint base URL, or None when it is not an
+    http(s) URL with a host and no query or fragment."""
+    parsed = urlsplit(url)
+    if parsed.query or parsed.fragment or "?" in url or "#" in url:
+        return None
+    origin = _origin(parsed)
+    if origin is None:
+        return None
+    return origin, parsed.path.rstrip("/")
+
+
+def _session_identity(url: str):
+    """(origin, path) of a session URL, or None when it is not an http(s) URL
+    with a host."""
+    parsed = urlsplit(url)
+    origin = _origin(parsed)
+    if origin is None:
+        return None
+    path = parsed.path
+    if path.endswith("/"):
+        path = path[:-1]
+    return origin, path
+
+
 def session_url_matches_endpoint(session_url: str, endpoint_base: str) -> bool:
-    """Whether a stored session URL belongs to an endpoint's base URL."""
+    """Whether a stored session URL belongs to an endpoint's base URL.
+
+    The base must be an http(s) URL with a host; scheme, host and effective
+    port must be equal, and the session path must be the base path or below it
+    on a segment boundary. A malformed base or session URL matches nothing and
+    never raises, so one bad ModelEndpoint row cannot mark every session of
+    its owner untrusted."""
     from src.endpoint_resolver import build_chat_url, normalize_base
 
     if not session_url or not endpoint_base:
         return False
-    sess = session_url.rstrip("/")
-    base = normalize_base(endpoint_base).rstrip("/")
-    variants = {
-        base,
-        base + "/chat/completions",
-        build_chat_url(base).rstrip("/"),
-    }
-    return sess in variants or sess.startswith(base + "/")
+    try:
+        sess = _session_identity(session_url.strip())
+        base = _base_identity(normalize_base(endpoint_base))
+        if sess is None or base is None:
+            return False
+        origin, base_path = base
+        if sess[0] != origin:
+            return False
+        if sess[1] == base_path or sess[1].startswith(base_path + "/"):
+            return True
+        chat = _session_identity(build_chat_url(normalize_base(endpoint_base)))
+        return chat is not None and sess == chat
+    except Exception:
+        return False
 
 
 def is_builtin_provider_url(url: str) -> bool:
