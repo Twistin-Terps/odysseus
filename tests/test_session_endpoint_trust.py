@@ -368,10 +368,7 @@ def _memory_audit(calls):
     return audit
 
 
-# /api/memory/audit is not guarded here: tests/test_memory_routes_session_owner.py::
-# test_audit_session_fallback_uses_resolver_without_manual_default pins that it
-# audits through an unregistered session URL.
-@pytest.mark.parametrize("path", ["extract", "import"])
+@pytest.mark.parametrize("path", ["extract", "audit", "import"])
 def test_memory_routes_refuse_untrusted_session_url(db, monkeypatch, path):
     with pytest.raises(HTTPException) as exc:
         _memory(monkeypatch, path, _session(UNTRUSTED))

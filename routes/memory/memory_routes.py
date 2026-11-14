@@ -302,6 +302,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         user = _owner(request)
         fallback_url = fallback_model = None
         fallback_headers = None
+        sess = None
         if session:
             try:
                 sess = session_manager.get_session(session)
@@ -315,6 +316,8 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         endpoint_url, model, headers = resolve_task_endpoint(
             fallback_url, fallback_model, fallback_headers, owner=user
         )
+        if sess is not None and uses_untrusted_session_url(endpoint_url, sess, user):
+            raise HTTPException(400, UNTRUSTED_ENDPOINT_MESSAGE)
 
         if not endpoint_url or not model:
             raise HTTPException(400, "No default model configured — set one in Settings")

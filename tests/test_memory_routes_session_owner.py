@@ -92,7 +92,7 @@ def test_audit_session_fallback_uses_resolver_without_manual_default(monkeypatch
     session_manager = MagicMock()
     session_manager.get_session.return_value = SimpleNamespace(
         owner="alice",
-        endpoint_url="http://session.example/v1/chat/completions",
+        endpoint_url="https://api.openai.com/v1/chat/completions",
         model="session-model",
         headers=session_headers,
     )
@@ -138,7 +138,7 @@ def test_audit_session_fallback_uses_resolver_without_manual_default(monkeypatch
     out = asyncio.run(audit_route(request=_request("alice"), session="session-1"))
 
     assert resolver_calls == [(
-        "http://session.example/v1/chat/completions",
+        "https://api.openai.com/v1/chat/completions",
         "session-model",
         session_headers,
         "alice",
@@ -146,7 +146,7 @@ def test_audit_session_fallback_uses_resolver_without_manual_default(monkeypatch
     assert audit_calls == [(
         memory_manager,
         memory_vector,
-        "http://session.example/v1/chat/completions",
+        "https://api.openai.com/v1/chat/completions",
         "session-model",
         session_headers,
         "alice",
