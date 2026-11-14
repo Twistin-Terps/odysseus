@@ -173,8 +173,19 @@ def _check_public_http_url(
     cleaned = (url or "").strip()
     if len(cleaned) > max_length:
         raise ValueError("URL is too long")
+    # urlparse silently drops tabs and newlines, so the URL returned would not
+    # be the URL judged; a backslash is read as "/" by some clients.
+    if any(
+        ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F or ch == "\\"
+        for ch in cleaned
+    ):
+        raise ValueError(_NOT_PUBLIC)
     parsed = urlparse(cleaned)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(_NOT_PUBLIC)
+    # Userinfo ("user:pass@host") misleads readers about the real host; an
+    # authority ending in ":" has an empty port.
+    if "@" in parsed.netloc or parsed.netloc.endswith(":"):
         raise ValueError(_NOT_PUBLIC)
     try:
         port = parsed.port

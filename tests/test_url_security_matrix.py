@@ -226,3 +226,61 @@ def test_exactly_one_resolver_call_per_validation(resolver):
     resolver.answer = [PUBLIC_V4, PUBLIC_V6]
     url_security.resolve_public_http_url("https://api.example.com/v1")
     assert resolver.calls == ["api.example.com"]
+
+
+# --- Authority and character rules ------------------------------------------
+
+@pytest.mark.parametrize("url", [
+    "https://api.example.com:/v1",
+    "https://[2606:4700:4700::1111]:/v1",
+])
+def test_empty_port_is_refused(resolver, url):
+    _refused(url)
+
+
+@pytest.mark.parametrize("url", [
+    "https://api.openai.com@evil.tld/v1",
+    "https://user:secret@api.example.com/v1",
+    "https://:secret@api.example.com/v1",
+    "https://@api.example.com/v1",
+])
+def test_userinfo_is_refused_without_echoing_it(resolver, url):
+    _refused(url)
+    with pytest.raises(ValueError) as exc:
+        url_security.resolve_public_http_url(url)
+    assert str(exc.value) == url_security._NOT_PUBLIC
+
+
+@pytest.mark.parametrize("url", [
+    "http://api.exa\nmple.com/v1",
+    "http://api.exa\tmple.com/v1",
+    "http://api.exa\rmple.com/v1",
+    "https://api.example.com/v\x001",
+    "https://api.example.com/v\x7f1",
+    "https://api.example.com/v 1",
+    "https://api.example.com\\@127.0.0.1/v1",
+    "https://api.example.com/v1\\x",
+])
+def test_control_whitespace_or_backslash_is_refused(resolver, url):
+    _refused(url)
+    with pytest.raises(ValueError) as exc:
+        url_security.resolve_public_http_url(url)
+    assert str(exc.value) == url_security._NOT_PUBLIC
+
+
+def test_refused_authority_makes_no_resolver_call(resolver):
+    for url in ("https://api.openai.com@evil.tld/v1", "https://api.example.com:/v1",
+                "http://api.exa\nmple.com/v1"):
+        _refused(url)
+    assert resolver.calls == []
+
+
+@pytest.mark.parametrize("url", [
+    "https://api.example.com/v1",
+    "https://api.example.com:8443/v1",
+    "https://[2606:4700:4700::1111]:8443/v1",
+])
+def test_plain_authority_still_accepted(resolver, url):
+    returned, ips = url_security.resolve_public_http_url(url)
+    assert returned == url and ips
+    assert url_security.is_public_http_url(url) is True
