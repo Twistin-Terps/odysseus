@@ -146,3 +146,76 @@ def test_path_tricks_are_refused(session_url):
 ])
 def test_plain_sub_paths_still_match(session_url):
     assert trust.session_url_matches_endpoint(session_url, CORP) is True
+
+
+# --- task-name generation only calls a trusted session URL -------------------
+
+TOKEN_URL = "http://attacker.example.test/v1/chat/completions"
+
+
+@pytest.fixture
+def task_routes_db(db, monkeypatch):
+    import routes.task.task_routes as task_routes
+
+    monkeypatch.setattr(task_routes, "SessionLocal", db)
+    return task_routes
+
+
+def _add_session(factory, sid, url, owner, minutes_ago):
+    from datetime import datetime, timedelta
+
+    with factory() as s:
+        s.add(cdb.Session(id=sid, name=sid, owner=owner, endpoint_url=url, model="m-" + sid,
+                          created_at=datetime.utcnow() - timedelta(minutes=minutes_ago)))
+        s.commit()
+
+
+async def _create_named_task(task_routes, monkeypatch, user, prompt):
+    from unittest.mock import MagicMock
+
+    from routes.task.task_routes import TaskCreate
+
+    calls = []
+
+    async def recorder(**kwargs):
+        calls.append(kwargs)
+        return "Generated Title"
+
+    monkeypatch.setattr("src.llm_core.llm_call_async", recorder)
+    monkeypatch.setattr(task_routes, "get_current_user", lambda request: user)
+    router = task_routes.setup_task_routes(MagicMock())
+    create = next(r.endpoint for r in router.routes
+                  if getattr(r, "path", None) == "/api/tasks" and "POST" in getattr(r, "methods", set()))
+    created = await create(SimpleNamespace(state=SimpleNamespace(current_user=user), headers={}),
+                           TaskCreate(prompt=prompt, task_type="llm", trigger_type="webhook"))
+    return created, calls
+
+
+@pytest.mark.asyncio
+async def test_task_name_skips_untrusted_newest_session(task_routes_db, db, monkeypatch):
+    _add_session(db, "token", TOKEN_URL, OWNER, minutes_ago=0)
+    created, calls = await _create_named_task(task_routes_db, monkeypatch, OWNER, "Summarize the weekly report")
+    assert calls == []
+    assert created["name"] == "Summarize the weekly report"
+
+
+@pytest.mark.asyncio
+async def test_task_name_uses_older_trusted_session(task_routes_db, db, monkeypatch):
+    _add_session(db, "trusted", CONFIGURED, OWNER, minutes_ago=10)
+    _add_session(db, "token", TOKEN_URL, OWNER, minutes_ago=0)
+    created, calls = await _create_named_task(task_routes_db, monkeypatch, OWNER, "Summarize the weekly report")
+    assert [c["url"] for c in calls] == [CONFIGURED]
+    assert calls[0]["model"] == "m-trusted"
+    assert created["name"] == "Generated Title"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user", [None, ""])
+async def test_task_name_with_empty_owner_uses_no_session(task_routes_db, db, monkeypatch, user):
+    # A shared endpoint is trusted even for an empty owner; it still must not
+    # pick some user's session.
+    _add_session(db, "bob-shared", SHARED, "bob", minutes_ago=0)
+    _add_session(db, "builtin", BUILTIN, "carol", minutes_ago=1)
+    created, calls = await _create_named_task(task_routes_db, monkeypatch, user, "Summarize the weekly report")
+    assert calls == []
+    assert created["name"] == "Summarize the weekly report"

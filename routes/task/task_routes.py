@@ -315,15 +315,21 @@ def setup_task_routes(task_scheduler) -> APIRouter:
         try:
             from src.llm_core import llm_call_async
             from core.database import Session as DbSession
+            from src.session_endpoint_trust import session_endpoint_is_trusted
+            if not owner:
+                # No owner filter would pick any user's session.
+                return prompt[:50].strip()
             db = SessionLocal()
             try:
-                q = db.query(DbSession).filter(
+                candidates = db.query(DbSession).filter(
                     DbSession.endpoint_url.isnot(None),
                     DbSession.model.isnot(None),
-                )
-                if owner:
-                    q = q.filter(DbSession.owner == owner)
-                recent = q.order_by(DbSession.created_at.desc()).first()
+                    DbSession.owner == owner,
+                ).order_by(DbSession.created_at.desc()).limit(20).all()
+                # Only a URL the server chose (built-in provider or a visible
+                # enabled ModelEndpoint); a token-created session's URL is not
+                # re-validated here.
+                recent = next((s for s in candidates if session_endpoint_is_trusted(s, owner)), None)
                 if not recent:
                     return prompt[:50].strip()
                 url, model = recent.endpoint_url, recent.model
