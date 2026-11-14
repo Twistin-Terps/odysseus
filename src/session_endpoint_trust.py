@@ -63,12 +63,21 @@ def _base_identity(url: str):
 
 def _session_identity(url: str):
     """(origin, path) of a session URL, or None when it is not an http(s) URL
-    with a host or its path holds a dot segment (also percent-encoded), a
+    with a host, has userinfo, a non-ASCII host, port 0, a control character
+    or whitespace, or its path holds a dot segment (also percent-encoded), a
     backslash, an encoded slash or an empty segment."""
     before_query = url.split("?", 1)[0].split("#", 1)[0]
     if "\\" in before_query:
         return None
+    # urlsplit silently drops tabs and newlines, so judge the raw text.
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
+        return None
     parsed = urlsplit(url)
+    # No userinfo; the host must be plain ASCII before it is case-folded
+    # (the Kelvin sign lowercases to "k"); an explicit port 0 is not the
+    # default port.
+    if "@" in parsed.netloc or not parsed.netloc.isascii() or parsed.port == 0:
+        return None
     origin = _origin(parsed)
     if origin is None:
         return None

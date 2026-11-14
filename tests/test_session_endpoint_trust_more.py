@@ -302,3 +302,78 @@ def test_server_built_chat_url_on_tailscale_host_is_trusted(tailscale_gpubox):
 def test_other_address_on_same_port_and_path_is_not_trusted(tailscale_gpubox):
     assert trust.session_url_matches_endpoint(
         "http://100.100.1.6:8080/v1/chat/completions", TAILSCALE_BASE) is False
+
+
+# --- session URL: port 0, userinfo, control characters, non-ASCII host -------
+
+@pytest.mark.parametrize("session_url", [
+    "https://llm.corp.example:0/v1/chat/completions",
+    "https://user:pw@llm.corp.example/v1/chat/completions",
+    "https://user@llm.corp.example/v1/chat/completions",
+    "https://llm.corp\n.example/v1/chat/completions",
+    "https://llm.corp.example/v1/chat\t/completions",
+    "https://llm.corp.example/v1/chat\r/completions",
+    "https://llm.corp.example/v1/chat /completions",
+    "https://llm.corp.example/v1/chat\x00/completions",
+    "https://llm.corp.example/v1/chat\x7f/completions",
+])
+def test_session_url_with_odd_authority_or_characters_is_refused(session_url):
+    assert trust.session_url_matches_endpoint(session_url, CORP) is False
+
+
+def test_non_ascii_host_that_folds_to_the_endpoint_host_is_refused():
+    base = "https://kimi.corp.example/v1"
+    assert trust.session_url_matches_endpoint(base + "/chat/completions", base) is True
+    # U+212A KELVIN SIGN lowercases to "k".
+    kelvin = "https://\u212aimi.corp.example/v1/chat/completions"
+    assert trust.session_url_matches_endpoint(kelvin, base) is False
+
+
+def test_punycode_endpoint_matches_its_punycode_session_url():
+    base = "https://xn--bcher-kva.example/v1"
+    assert trust.session_url_matches_endpoint(base + "/chat/completions", base) is True
+    assert trust.session_url_matches_endpoint("https://bücher.example/v1/chat/completions", base) is False
+
+
+# --- matcher regression set --------------------------------------------------
+
+@pytest.fixture
+def dns_ok(monkeypatch):
+    from src import endpoint_resolver as er
+
+    monkeypatch.setattr(er, "_tailscale_cache", {})
+    monkeypatch.setattr(er.socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("203.0.113.9", 0))])
+    return er
+
+
+@pytest.mark.parametrize("session_url, base", [
+    (CORP, CORP),
+    (CORP + "/chat/completions", CORP),
+    (CORP + "/chat/completions", CORP + "/chat/completions"),
+    (CORP + "/chat/completions", CORP + "/"),
+    ("https://llm.corp.example:443/v1/chat/completions", CORP),
+    ("http://llm.corp.example:80/v1/chat/completions", "http://llm.corp.example/v1"),
+    ("http://llm.corp.example/v1/chat/completions", "http://llm.corp.example:80/v1"),
+    ("https://LLM.Corp.EXAMPLE/v1/chat/completions", CORP),
+    ("https://llm.corp.example./v1/chat/completions", CORP),
+])
+def test_regression_set_still_trusted(dns_ok, session_url, base):
+    assert trust.session_url_matches_endpoint(session_url, base) is True
+
+
+@pytest.mark.parametrize("base", ["http://ollama.corp.example:11434", "https://api.anthropic.com/v1"])
+def test_provider_style_endpoints_trust_their_built_chat_url(dns_ok, base):
+    assert trust.session_url_matches_endpoint(dns_ok.build_chat_url(base), base) is True
+
+
+@pytest.mark.parametrize("session_url, base", [
+    ("https://llm.corp.example.evil/v1/chat/completions", CORP),
+    ("https://llm-corp.example/v1/chat/completions", CORP),
+    ("https://llm.corp.example:8443/v1/chat/completions", CORP),
+    ("http://llm.corp.example/v1/chat/completions", CORP),
+    ("https://llm.corp.example/v1evil/chat/completions", CORP),
+    ("https://llm.corp.example/v1/../admin/chat/completions", CORP),
+    ("https://llm.corp.example/v1/chat/completions", "https:///v1"),
+])
+def test_regression_set_still_refused(dns_ok, session_url, base):
+    assert trust.session_url_matches_endpoint(session_url, base) is False
