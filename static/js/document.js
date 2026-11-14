@@ -4169,6 +4169,10 @@ import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
     // source page. Editor-applied formatting is unaffected; this only cleans
     // newly pasted HTML before it enters the browser's undo stack.
     tpl.content.querySelectorAll('img, video, audio, canvas').forEach(el => el.remove());
+    // The strict sanitiser above turns a remote <img> into a click-to-load
+    // placeholder link. Pasted images are dropped, so drop that placeholder
+    // too; otherwise its "Remote image blocked" text lands in the document.
+    tpl.content.querySelectorAll('a.chat-image-remote').forEach(el => el.remove());
     tpl.content.querySelectorAll('*').forEach(el => {
       if (!allowedTags.has(el.tagName)) {
         el.replaceWith(...Array.from(el.childNodes));

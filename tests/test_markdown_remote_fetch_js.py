@@ -361,3 +361,23 @@ def test_document_editor_call_sites_pass_the_opt_out():
     assert all("keepRemoteMedia" not in args for args in paste), paste
     # Exactly the six calls above opt out, nothing else in the editor.
     assert document_source().count("keepRemoteMedia") == 6
+
+
+# The paste cleaner stays strict, so a pasted remote <img> comes back from the
+# sanitiser as the placeholder link. The cleaner drops pasted images; it must
+# drop that placeholder too, or its "Remote image blocked" text is written
+# into the user's document.
+def test_paste_cleaner_drops_the_remote_image_placeholder(node_available):
+    from tests.helpers.document_source import function_body
+
+    (html,) = _sanitize_all([
+        ['<p><img src="https://cdn.example.org/photo.jpg" alt="Team photo"></p>', None],
+    ])
+    # What the cleaner receives: an <a> carrying the placeholder class.
+    assert '<a class="chat-image chat-image-remote"' in html, html
+
+    body = function_body("_cleanRichTextPasteHtml")
+    drop = "querySelectorAll('a.chat-image-remote').forEach(el => el.remove())"
+    assert drop in body, "paste cleaner keeps the remote-image placeholder"
+    # It runs after sanitising and before the tag allowlist unwraps nodes.
+    assert body.index("sanitizeAllowedHtml") < body.index(drop) < body.index("allowedTags.has(el.tagName)")
