@@ -456,3 +456,39 @@ def test_ai_reply_still_uses_trusted_session_url(db, monkeypatch, url):
     calls = []
     _ai_reply(monkeypatch, db, url, lambda u, headers=None: calls.append(u) or [])
     assert calls == [url]
+
+
+# ---------------------------------------------------------------- background tool-job summary
+
+
+def _background_summary(monkeypatch, db, url, calls):
+    import src.llm_core as llm_core
+    from src.background_tool_jobs import BackgroundToolJobs
+
+    monkeypatch.setattr(cdb, "SessionLocal", db)
+    with db() as s:
+        s.add(cdb.Session(id="s1", name="t", owner=OWNER, endpoint_url=url, model=KNOWN_MODEL))
+        s.commit()
+    monkeypatch.setattr(llm_core, "llm_call_async", _recorder(calls))
+    jobs = BackgroundToolJobs(is_busy=lambda sid: False)
+    jobs.register("rp-trust", "s1", OWNER, "research", "query", 2)
+    jobs.complete("rp-trust", "Report body.", [])
+    asyncio.run(jobs.tick())
+    row = jobs.list_for_chat("s1", OWNER)[0]
+    assert row["status"] == "delivered"
+    return row["message"]["content"]
+
+
+def test_background_summary_refuses_untrusted_session_url(db, monkeypatch):
+    calls = []
+    content = _background_summary(monkeypatch, db, UNTRUSTED, calls)
+    assert calls == []
+    assert content.startswith("Research finished, but I could not generate its chat summary.")
+
+
+@pytest.mark.parametrize("url", [CONFIGURED, BUILTIN])
+def test_background_summary_still_uses_trusted_session_url(db, monkeypatch, url):
+    calls = []
+    content = _background_summary(monkeypatch, db, url, calls)
+    assert calls == [url]
+    assert content.startswith("Summary")
