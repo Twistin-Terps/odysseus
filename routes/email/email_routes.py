@@ -6969,6 +6969,9 @@ def setup_email_routes():
                         if not requested_model:
                             model = sess.model
                     _db.close()
+                    from src.session_endpoint_trust import UNTRUSTED_ENDPOINT_MESSAGE, uses_untrusted_session_url
+                    if uses_untrusted_session_url(url, sess, owner):
+                        return {"success": False, "error": UNTRUSTED_ENDPOINT_MESSAGE}
                 except Exception as e:
                     logger.warning(f"Failed to read session endpoint: {e}")
 

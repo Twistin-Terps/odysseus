@@ -30,6 +30,7 @@ from services.memory.memory_extractor import audit_memories
 from src.auth_helpers import get_current_user, require_user
 from src.endpoint_resolver import resolve_endpoint
 from src.task_endpoint import resolve_task_endpoint
+from src.session_endpoint_trust import UNTRUSTED_ENDPOINT_MESSAGE, uses_untrusted_session_url
 from src.upload_limits import read_upload_limited, MEMORY_IMPORT_MAX_BYTES
 
 logger = logging.getLogger(__name__)
@@ -260,6 +261,8 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
         t_url, t_model, t_headers = resolve_task_endpoint(
             sess.endpoint_url, sess.model, sess.headers, owner=_owner(request)
         )
+        if uses_untrusted_session_url(t_url, sess, _owner(request)):
+            raise HTTPException(400, UNTRUSTED_ENDPOINT_MESSAGE)
 
         from src.utility_effort import effort_for_call
 
@@ -374,6 +377,8 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
                 endpoint_url, model, headers = resolve_task_endpoint(
                     sess.endpoint_url, sess.model, sess.headers, owner=user
                 )
+                if uses_untrusted_session_url(endpoint_url, sess, user):
+                    raise HTTPException(400, UNTRUSTED_ENDPOINT_MESSAGE)
         else:
             endpoint_url, model, headers = resolve_task_endpoint(owner=user)
     

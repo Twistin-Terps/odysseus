@@ -317,3 +317,145 @@ def test_compact_with_utility_endpoint_ignores_untrusted_session_url(db, monkeyp
     monkeypatch.setattr(model_context.httpx, "get", _forbidden)
     _compact(monkeypatch, db, route, _session(UNTRUSTED), _recorder(calls), utility=True)
     assert calls == [UTILITY]
+
+
+# ---------------------------------------------------------------- memory routes
+
+
+def _memory(monkeypatch, path, sess, llm=None, audit=None, utility=False):
+    """Call /api/memory/{extract,audit,import}. The task resolver returns the
+    session fallback unless ``utility`` is set."""
+    import routes.memory.memory_routes as memory_routes
+    import src.auth_helpers as auth_helpers
+    import src.utility_effort as utility_effort
+
+    def fake_resolve(fallback_url=None, fallback_model=None, fallback_headers=None, owner=None):
+        if utility:
+            return UTILITY, "util-model", {}
+        return fallback_url, fallback_model, fallback_headers
+
+    async def fake_read(file, limit, label):
+        return b"Alice likes green tea."
+
+    monkeypatch.setattr(memory_routes, "get_current_user", lambda request: OWNER)
+    monkeypatch.setattr(memory_routes, "require_user", lambda request: OWNER)
+    monkeypatch.setattr(auth_helpers, "require_privilege", lambda *a, **k: None)
+    monkeypatch.setattr(utility_effort, "effort_for_call", lambda *a, **k: None)
+    monkeypatch.setattr(memory_routes, "resolve_task_endpoint", fake_resolve)
+    monkeypatch.setattr(memory_routes, "read_upload_limited", fake_read)
+    monkeypatch.setattr(memory_routes, "llm_call_async", llm or _forbidden_async)
+    monkeypatch.setattr(memory_routes, "audit_memories", audit or _forbidden_async)
+    router = memory_routes.setup_memory_routes(None, _Manager(sess))
+    endpoint = _endpoint(router, "/api/memory/" + path)
+    if path == "import":
+        call = endpoint(_request(), session="s1", file=SimpleNamespace(filename="notes.txt"))
+    else:
+        call = endpoint(_request(), session="s1")
+    return asyncio.run(call)
+
+
+def _memory_llm(calls):
+    async def llm(url, model, messages, **kwargs):
+        calls.append(url)
+        return "[]"
+    return llm
+
+
+def _memory_audit(calls):
+    async def audit(manager, vector, url, model, headers, owner=None):
+        calls.append(url)
+        return {"before": 1, "after": 1}
+    return audit
+
+
+# /api/memory/audit is not guarded here: tests/test_memory_routes_session_owner.py::
+# test_audit_session_fallback_uses_resolver_without_manual_default pins that it
+# audits through an unregistered session URL.
+@pytest.mark.parametrize("path", ["extract", "import"])
+def test_memory_routes_refuse_untrusted_session_url(db, monkeypatch, path):
+    with pytest.raises(HTTPException) as exc:
+        _memory(monkeypatch, path, _session(UNTRUSTED))
+    assert exc.value.status_code == 400
+    assert exc.value.detail == trust.UNTRUSTED_ENDPOINT_MESSAGE
+    assert "rebind" not in exc.value.detail
+
+
+@pytest.mark.parametrize("path", ["extract", "audit", "import"])
+@pytest.mark.parametrize("url", [CONFIGURED, BUILTIN])
+def test_memory_routes_still_work_for_trusted_urls(db, monkeypatch, path, url):
+    calls = []
+    _memory(monkeypatch, path, _session(url), llm=_memory_llm(calls), audit=_memory_audit(calls))
+    assert calls == [url]
+
+
+@pytest.mark.parametrize("path", ["extract", "audit", "import"])
+def test_memory_routes_with_task_endpoint_ignore_untrusted_session_url(db, monkeypatch, path):
+    calls = []
+    _memory(monkeypatch, path, _session(UNTRUSTED), llm=_memory_llm(calls), audit=_memory_audit(calls),
+            utility=True)
+    assert calls == [UTILITY]
+
+
+# ---------------------------------------------------------------- send_to_session agent tool
+
+
+def _send_to_session(monkeypatch, sess, llm):
+    import src.agent_tools.session_tools as session_tools
+    import src.llm_core as llm_core
+
+    sess.name = "target"
+    sess.add_message = lambda msg: None
+    monkeypatch.setattr(session_tools, "get_session_manager", lambda: _Manager(sess))
+    monkeypatch.setattr(llm_core, "llm_call_async", llm)
+    return asyncio.run(session_tools.send_to_session("s1\nhello", owner=OWNER))
+
+
+def test_send_to_session_refuses_untrusted_session_url(db, monkeypatch):
+    result = _send_to_session(monkeypatch, _session(UNTRUSTED), _forbidden_async)
+    assert result == {"error": trust.UNTRUSTED_ENDPOINT_MESSAGE}
+
+
+@pytest.mark.parametrize("url", [CONFIGURED, BUILTIN])
+def test_send_to_session_still_works_for_trusted_urls(db, monkeypatch, url):
+    calls = []
+    result = _send_to_session(monkeypatch, _session(url), _recorder(calls))
+    assert calls == [url]
+    assert result["response"] == "Summary"
+
+
+# ---------------------------------------------------------------- email ai-reply
+
+
+def _ai_reply(monkeypatch, db, url, list_models):
+    import routes.email.email_routes as email_routes
+    import src.llm_core as llm_core
+
+    monkeypatch.setattr(cdb, "SessionLocal", db)
+    with db() as s:
+        s.add(cdb.Session(id="s1", name="t", owner=OWNER, endpoint_url=url, model=KNOWN_MODEL))
+        s.commit()
+    monkeypatch.setattr(email_routes, "_load_settings", lambda: {})
+    monkeypatch.setattr(email_routes, "_get_email_writing_style_for_account", lambda settings, account_id: "")
+
+    def stop(*args, **kwargs):
+        raise RuntimeError("stop after the model lookup")
+
+    monkeypatch.setattr(email_routes, "_get_email_config", stop)
+    monkeypatch.setattr(llm_core, "list_model_ids", list_models)
+    monkeypatch.setattr(llm_core, "llm_call_async_with_fallback", _forbidden_async)
+    monkeypatch.setattr(llm_core, "llm_call_async", _forbidden_async)
+    router = email_routes.setup_email_routes()
+    reply = _endpoint(router, "/api/email/ai-reply")
+    return asyncio.run(reply({"original_body": "Hello there", "session_id": "s1", "fast": True}, owner=OWNER))
+
+
+def test_ai_reply_refuses_untrusted_session_url(db, monkeypatch):
+    result = _ai_reply(monkeypatch, db, UNTRUSTED, _forbidden)
+    assert result == {"success": False, "error": trust.UNTRUSTED_ENDPOINT_MESSAGE}
+
+
+@pytest.mark.parametrize("url", [CONFIGURED, BUILTIN])
+def test_ai_reply_still_uses_trusted_session_url(db, monkeypatch, url):
+    calls = []
+    _ai_reply(monkeypatch, db, url, lambda u, headers=None: calls.append(u) or [])
+    assert calls == [url]
