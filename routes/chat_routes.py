@@ -1758,35 +1758,24 @@ def _resolve_workspace_from_message_path(request, message: str) -> tuple[str, st
 
 
 def _session_url_matches_endpoint(session_url: str, endpoint_base: str) -> bool:
-    if not session_url or not endpoint_base:
-        return False
-    sess = session_url.rstrip("/")
-    base = _normalize_base(endpoint_base).rstrip("/")
-    variants = {
-        base,
-        base + "/chat/completions",
-        build_chat_url(base).rstrip("/"),
-    }
-    return sess in variants or sess.startswith(base + "/")
+    from src.session_endpoint_trust import session_url_matches_endpoint
+    return session_url_matches_endpoint(session_url, endpoint_base)
 
 
 def _clear_orphaned_session_endpoint(sess, owner: str | None = None) -> bool:
-    """Clear a session model if its endpoint was deleted from ModelEndpoint."""
+    """Clear a session model if its endpoint was deleted from ModelEndpoint.
+
+    Fails closed: when the endpoint lookup fails, the request is refused
+    (HTTP 503) rather than sent to an unverified URL.
+    """
+    from src.session_endpoint_trust import session_matches_visible_endpoint
     if not getattr(sess, "endpoint_url", ""):
         return False
     db = SessionLocal()
     try:
-        q = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)
-        if owner:
-            from src.auth_helpers import owner_filter
-            q = owner_filter(q, ModelEndpoint, owner)
-        endpoints = q.all()
+        if session_matches_visible_endpoint(db, sess, owner):
+            return False
         bound_id = getattr(sess, "endpoint_id", None)
-        for ep in endpoints:
-            if bound_id and ep.id != bound_id:
-                continue
-            if _session_url_matches_endpoint(sess.endpoint_url or "", ep.base_url or ""):
-                return False
         if bound_id:
             # Keep the identity so re-enabling/reconnecting A can recover A.
             # Returning True stops chat; B must never replace a missing A.
@@ -1807,9 +1796,9 @@ def _clear_orphaned_session_endpoint(sess, owner: str | None = None) -> bool:
         sess.headers = {}
         return True
     except Exception as e:
-        logger.warning("Failed to clear orphaned session endpoint", exc_info=e)
+        logger.warning("Failed to verify session endpoint; refusing the request", exc_info=e)
         db.rollback()
-        return False
+        raise HTTPException(503, "Could not verify the selected model endpoint. Try again.") from None
     finally:
         db.close()
 
@@ -5233,6 +5222,9 @@ def setup_chat_routes(
             sess = session_manager.get_session(session_id)
         except (KeyError, SessionNotFoundError):
             raise HTTPException(404, "Session not found")
+        from src.session_endpoint_trust import UNTRUSTED_ENDPOINT_MESSAGE, session_endpoint_is_trusted
+        if not session_endpoint_is_trusted(sess, getattr(sess, "owner", None) or effective_user(request)):
+            raise HTTPException(400, UNTRUSTED_ENDPOINT_MESSAGE)
 
         messages = [
             {"role": "system", "content": (

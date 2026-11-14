@@ -929,9 +929,15 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
             from src.model_context import estimate_tokens, get_context_length
             from src.model_profiles import supports_user_thinking_toggle
 
+            from src.session_endpoint_trust import known_context_length, session_endpoint_is_trusted
+
             messages = session.get_context_messages()
             used = int(estimate_tokens(messages))
-            ctx_len = int(get_context_length(session.endpoint_url, session.model) or 0)
+            if session_endpoint_is_trusted(session, getattr(session, "owner", None) or effective_user(request)):
+                ctx_len = int(get_context_length(session.endpoint_url, session.model) or 0)
+            else:
+                # Untrusted stored URL: table value only, never probe it.
+                ctx_len = known_context_length(session.model)
             thinking_supported = supports_user_thinking_toggle(session.model)
             pct = round((used / ctx_len) * 100, 1) if ctx_len else 0.0
             pct = max(0.0, min(100.0, pct))

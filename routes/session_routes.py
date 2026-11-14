@@ -1629,7 +1629,12 @@ def setup_session_routes(
             }
         try:
             from src.model_context import get_context_length
-            ctx = get_context_length(session.endpoint_url, session.model)
+            from src.session_endpoint_trust import known_context_length, session_endpoint_is_trusted
+            if session_endpoint_is_trusted(session, getattr(session, "owner", None) or owner):
+                ctx = get_context_length(session.endpoint_url, session.model)
+            else:
+                # Untrusted stored URL: table value only, never probe it.
+                ctx = known_context_length(session.model)
             return {
                 "context_length": ctx,
                 "model": session.model,
