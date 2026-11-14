@@ -9,7 +9,7 @@ a built-in provider URL, or an enabled ``ModelEndpoint`` the owner can see.
 from __future__ import annotations
 
 import logging
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from core.database import ModelEndpoint, SessionLocal
 
@@ -63,7 +63,11 @@ def _base_identity(url: str):
 
 def _session_identity(url: str):
     """(origin, path) of a session URL, or None when it is not an http(s) URL
-    with a host."""
+    with a host or its path holds a dot segment (also percent-encoded), a
+    backslash, an encoded slash or an empty segment."""
+    before_query = url.split("?", 1)[0].split("#", 1)[0]
+    if "\\" in before_query:
+        return None
     parsed = urlsplit(url)
     origin = _origin(parsed)
     if origin is None:
@@ -71,6 +75,11 @@ def _session_identity(url: str):
     path = parsed.path
     if path.endswith("/"):
         path = path[:-1]
+    if path:
+        for segment in path[1:].split("/"):
+            decoded = unquote(segment)
+            if not segment or decoded in {".", ".."} or "/" in decoded or "\\" in decoded:
+                return None
     return origin, path
 
 

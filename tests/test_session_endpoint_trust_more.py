@@ -116,3 +116,33 @@ def test_malformed_row_does_not_lock_owner_out(db):
     assert trust.session_endpoint_is_trusted(_sess("https://good.example/v1/chat/completions"), OWNER) is True
     assert trust.session_endpoint_is_trusted(_sess("https://h.example/v1/chat/completions"), OWNER) is False
 
+
+# --- session_url_matches_endpoint: no path tricks -----------------------------
+
+@pytest.mark.parametrize("session_url", [
+    CORP + "/../../admin/chat/completions",
+    CORP + "/./chat/completions",
+    CORP + "/%2e%2e/%2e%2e/admin/chat/completions",
+    CORP + "/%2E%2E/admin",
+    CORP + "/.%2e/admin",
+    CORP + "/..",
+    CORP + "/..?x=1",
+    CORP + "\\..\\admin",
+    CORP + "/chat\\..\\..\\admin",
+    CORP + "//chat/completions",
+    CORP + "/chat//completions",
+    CORP + "/..%2fadmin",
+    CORP + "/chat%5c..%5cadmin",
+])
+def test_path_tricks_are_refused(session_url):
+    assert trust.session_url_matches_endpoint(session_url, CORP) is False
+
+
+@pytest.mark.parametrize("session_url", [
+    CORP + "/chat/completions",
+    CORP + "/chat/completions?api-version=1",
+    CORP + "/other/chat/completions",
+    CORP + "/v1.5/chat/completions",
+])
+def test_plain_sub_paths_still_match(session_url):
+    assert trust.session_url_matches_endpoint(session_url, CORP) is True
