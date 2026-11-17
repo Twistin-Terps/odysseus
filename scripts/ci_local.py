@@ -7,27 +7,40 @@ Usage:
     python3 scripts/ci_local.py --only gitleaks,actionlint
     python3 scripts/ci_local.py --shard 2/4     # one pytest shard instead of all four
     python3 scripts/ci_local.py --list          # what maps to which CI job, and what cannot run locally
+    python3 scripts/ci_local.py --strict        # exit 1 unless the run was as thorough as CI
 
 Each check mirrors one GitHub Actions job. Tool and runtime versions are read
 from the workflow files at run time, so the harness follows the pins in
 .github/workflows/ instead of keeping its own copy.
 
-Nothing here uses sudo or changes system packages. Python environments, npm
-packages, Playwright browsers and pinned tool binaries are installed into a
-cache directory outside the repository (``$ODYSSEUS_CI_CACHE``, default
-``~/.cache/odysseus-ci-local``), plus ``node_modules/`` exactly as ``npm ci``
-creates it. When a check needs something the machine lacks (Python 3.11 with
-no ``uv`` to fetch it, a Docker daemon, ...), it is reported as SKIP with the
-reason. A SKIP is not a pass: the summary says how many blocking checks did not
-run, and ``--strict`` turns them into a failure.
+Nothing here uses sudo or changes system packages. Python environments
+(including any Python that uv downloads), npm packages, Playwright browsers and
+pinned tool binaries live in a cache directory outside the repository
+(``$ODYSSEUS_CI_CACHE``, default ``~/.cache/odysseus-ci-local``), plus
+``node_modules/`` exactly as ``npm ci`` creates it. Unlike CI, the harness does
+not install Chromium's system libraries (``playwright install --with-deps``
+needs root); if they are missing, the browser tests fail rather than pass.
 
-Exit status: 0 when no blocking check failed (and, with --strict, none was
-skipped); 1 otherwise; 2 for usage errors.
+Checks read the working tree, while CI checks out the commit. The summary warns
+when uncommitted or untracked files could make the two differ, and the secret
+scan also covers staged and unstaged changes.
+
+Results:
+    PASS   the check ran as CI runs it and passed
+    PASS*  it passed, but ran with weaker coverage than CI (see its notes)
+    FAIL   it failed
+    SKIP   it could not run on this machine (reason given); not a pass
+    INFO   report-only check
+
+Exit status: 1 when a blocking check failed; with --strict, also when a
+blocking check was skipped, ran with weaker coverage, or was not selected.
+0 otherwise. 2 for usage errors.
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import os
 import re
@@ -47,11 +60,17 @@ WORKFLOWS = REPO / ".github" / "workflows"
 # hadolint is pinned only inside hadolint/hadolint-action@2a66e89f (v3.4.0),
 # whose Dockerfile is FROM ghcr.io/hadolint/hadolint:v2.15.0-debian. Upstream
 # publishes no checksum for the release binary, so this digest was computed
-# from the v2.15.0 hadolint-linux-x86_64 release asset on 2026-11-17. It is
-# only used when neither a hadolint binary nor a Docker daemon is available.
+# from the v2.15.0 hadolint-linux-x86_64 release asset on 2026-11-17.
 HADOLINT_VERSION = "2.15.0"
 HADOLINT_IMAGE = f"ghcr.io/hadolint/hadolint:v{HADOLINT_VERSION}-debian"
 HADOLINT_LINUX_X86_64_SHA256 = "eb8eb4dd06a068cce65cb84743fba69f09ed12a36ff13d58f9af090d6d696970"
+
+# The release assets CI downloads, and so the only ones with pinned checksums,
+# are linux-x86_64 builds.
+IS_LINUX_X86_64 = sys.platform == "linux" and os.uname().machine == "x86_64"
+
+# Variables that would steer pytest differently from a clean CI runner.
+PYTEST_ENV_SCRUB = ("PYTEST_ADDOPTS", "PYTEST_PLUGINS", "APP_PORT")
 
 
 # --------------------------------------------------------------------------
@@ -79,6 +98,7 @@ class Pins:
     python_tests: str
     python_security: str
     node: str
+    uv: str
     playwright: str
     cmarkgfm: str
     gitleaks_version: str
@@ -103,9 +123,10 @@ def read_pins() -> Pins:
     shard_list = _one(r'^\s*shard:\s*\[([^\]]+)\]', ci, "the pytest shard matrix")
     ignore = _one(r'^\s*ignore:\s*(\S.*)$', container, "the hadolint ignore list")
     return Pins(
-        python_tests=_one(r'python-version:\s*"?(3\.\d+)"?', ci, "the CI Python version"),
-        python_security=_one(r"python-version:\s*'?\"?(3\.\d+)", wsec, "the zizmor Python version"),
-        node=_one(r'node-version:\s*"?([\d.]+)"?', ci, "the Node version"),
+        python_tests=_one(r'python-version:\s*["\']?(3\.\d+)', ci, "the CI Python version"),
+        python_security=_one(r'python-version:\s*["\']?(3\.\d+)', wsec, "the zizmor Python version"),
+        node=_one(r'node-version:\s*["\']?([\d.]+)', ci, "the Node version"),
+        uv=_one(r'^\s*version:\s*["\']?([\d.]+)', ci, "the uv version"),
         playwright=_one(r'"playwright==([\d.]+)"', ci, "the Python Playwright pin"),
         cmarkgfm=_one(r'"cmarkgfm==([\d.]+)"', ci, "the cmarkgfm pin"),
         gitleaks_version=_one(r"GITLEAKS_VERSION:\s*([\d.]+)", secret, "the gitleaks version"),
@@ -123,6 +144,11 @@ def read_pins() -> Pins:
         hadolint_ignore=tuple(i.strip() for i in ignore.split(",")),
         pr_title_regex=_one(r"const re = /(.+)/;", prdesc, "the PR title regex"),
     )
+
+
+def pr_title_ok(regex: str, title: str) -> bool:
+    """Match like the workflow's JavaScript regex: \\w and friends are ASCII-only."""
+    return re.match(regex, title, re.ASCII) is not None
 
 
 # --------------------------------------------------------------------------
@@ -146,27 +172,45 @@ class Result:
     seconds: float = 0.0
     parity: list[str] = field(default_factory=list)
 
+    @property
+    def degraded(self) -> bool:
+        return self.status == PASS and bool(self.parity)
+
+
+def cache_dir() -> Path:
+    raw = os.environ.get("ODYSSEUS_CI_CACHE") or str(
+        Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "odysseus-ci-local"
+    )
+    return Path(raw).expanduser().resolve()
+
 
 class Context:
     def __init__(self, args: argparse.Namespace, pins: Pins):
         self.args = args
         self.pins = pins
-        self.cache = Path(
-            os.environ.get("ODYSSEUS_CI_CACHE")
-            or Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "odysseus-ci-local"
-        )
+        self.cache = cache_dir()
         self.cache.mkdir(parents=True, exist_ok=True)
+        if args.reinstall and (self.cache / "bin").exists():
+            shutil.rmtree(self.cache / "bin")
         self.parity: list[str] = []
-        self.failures: list[str] = []
 
     def note(self, message: str) -> None:
-        self.parity.append(message)
+        if message not in self.parity:
+            self.parity.append(message)
+
+    def uv_env(self) -> dict[str, str]:
+        """Keep any Python that uv downloads inside the cache."""
+        return {
+            "UV_PYTHON_INSTALL_DIR": str(self.cache / "uv-python"),
+            "UV_PYTHON_BIN_DIR": str(self.cache / "uv-python" / "bin"),
+        }
 
     def run(self, cmd: list[str] | str, *, env: dict[str, str] | None = None,
-            cwd: Path = REPO, check: bool = True, shell: bool = False) -> int:
+            cwd: Path = REPO, check: bool = True, shell: bool = False,
+            base_env: dict[str, str] | None = None) -> int:
         shown = cmd if isinstance(cmd, str) else " ".join(cmd)
         print(f"  $ {shown}", flush=True)
-        full_env = {**os.environ, **(env or {})}
+        full_env = {**(os.environ if base_env is None else base_env), **(env or {})}
         proc = subprocess.run(
             cmd, cwd=cwd, env=full_env, shell=shell,
             executable="/bin/bash" if shell else None,
@@ -189,8 +233,26 @@ def _digest(*paths: Path, extra: str = "") -> str:
     return h.hexdigest()
 
 
+def git_output(*args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=REPO, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def tree_changes() -> tuple[list[str], list[str]]:
+    """Return (modified or staged tracked paths, untracked non-ignored paths)."""
+    out = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=REPO, capture_output=True, text=True, check=True,
+    ).stdout
+    modified, untracked = [], []
+    for line in out.splitlines():
+        (untracked if line.startswith("??") else modified).append(line[3:])
+    return modified, untracked
+
+
 # --------------------------------------------------------------------------
-# Environments: Python venvs, npm packages, pinned binaries
+# Environments: Python, venvs, npm packages, pinned binaries
 # --------------------------------------------------------------------------
 
 
@@ -198,35 +260,20 @@ def find_python(ctx: Context, version: str) -> list[str]:
     """Return a command that runs Python `version`, or raise Skip."""
     exe = shutil.which(f"python{version}")
     if exe:
-        return [exe]
-    if shutil.which("uv"):
-        found = subprocess.run(
-            ["uv", "python", "find", version], capture_output=True, text=True
-        )
-        if found.returncode != 0:
-            ctx.run(["uv", "python", "install", version])
-            found = subprocess.run(
-                ["uv", "python", "find", version], capture_output=True, text=True, check=True
-            )
-        return [found.stdout.strip()]
-    raise Skip(f"Python {version} is needed (CI pins it) and neither python{version} nor uv is installed")
-
-
-def venv(ctx: Context, label: str, version: str, installs: list[list[str]], key: str) -> Path:
-    """Create or reuse a cached venv; reinstall when `key` changes. Returns its python."""
-    base_python = find_python(ctx, version)
-    root = ctx.cache / f"venv-{label}-py{version}"
-    py = root / "bin" / "python"
-    marker = root / ".ci-local-key"
-    if py.exists() and marker.exists() and marker.read_text() == key and not ctx.args.reinstall:
-        return py
-    if root.exists():
-        shutil.rmtree(root)
-    ctx.run([*base_python, "-m", "venv", str(root)])
-    for step in installs:
-        ctx.run([str(py) if part == "{py}" else part for part in step])
-    marker.write_text(key)
-    return py
+        probe = subprocess.run([exe, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+                               capture_output=True, text=True)
+        if probe.returncode == 0 and probe.stdout.strip() == version:
+            return [exe]
+    if shutil.which("uv") is None:
+        raise Skip(f"Python {version} is needed (CI pins it) and neither python{version} nor uv is installed")
+    env = {**os.environ, **ctx.uv_env()}
+    found = subprocess.run(["uv", "python", "find", version], capture_output=True, text=True, env=env)
+    if found.returncode != 0:
+        install = subprocess.run(["uv", "python", "install", "--no-bin", version], env=env)
+        found = subprocess.run(["uv", "python", "find", version], capture_output=True, text=True, env=env)
+        if install.returncode != 0 or found.returncode != 0:
+            raise Skip(f"Python {version} is needed and uv could not install it (offline?)")
+    return [found.stdout.strip()]
 
 
 def pip_install(*args: str) -> list[str]:
@@ -236,23 +283,60 @@ def pip_install(*args: str) -> list[str]:
     return ["{py}", "-m", "pip", "install", "--disable-pip-version-check", *args]
 
 
+def check_uv_version(ctx: Context) -> None:
+    if shutil.which("uv") is None:
+        ctx.note(f"uv is not installed, so pip resolved the packages; CI uses uv {ctx.pins.uv}.")
+        return
+    version = subprocess.run(["uv", "--version"], capture_output=True, text=True).stdout.split()
+    if len(version) < 2 or version[1] != ctx.pins.uv:
+        found = version[1] if len(version) > 1 else "unknown"
+        ctx.note(f"uv is {found}; CI pins uv {ctx.pins.uv}.")
+
+
+def venv(ctx: Context, label: str, version: str, steps: list[list[str]], key: str) -> Path:
+    """Create or reuse a cached venv and return its python.
+
+    The venv is rebuilt from scratch, running `steps`, whenever `key` changes
+    or --reinstall is given.
+    """
+    root = ctx.cache / f"venv-{label}-py{version}"
+    py = root / "bin" / "python"
+    marker = root / ".ci-local-key"
+    if py.exists() and marker.exists() and marker.read_text() == key and not ctx.args.reinstall:
+        return py
+    base_python = find_python(ctx, version)
+    if root.exists():
+        shutil.rmtree(root)
+    ctx.run([*base_python, "-m", "venv", str(root)])
+    for step in steps:
+        ctx.run([str(py) if part == "{py}" else part for part in step], env=ctx.uv_env())
+    marker.write_text(key)
+    return py
+
+
 def npm_install(ctx: Context, *, ignore_scripts: bool) -> None:
-    """Run `npm ci` only when package-lock.json or the install mode changed."""
+    """Run `npm ci` unless node_modules already matches the manifest, lockfile and mode."""
     need("node", "npm")
     node = subprocess.run(["node", "--version"], capture_output=True, text=True).stdout.strip()
     if node != f"v{ctx.pins.node}":
         ctx.note(f"Node is {node}; CI pins v{ctx.pins.node}.")
-    mode = "ignore-scripts" if ignore_scripts else "full"
-    key = _digest(REPO / "package-lock.json", extra=mode)
+
+    def key(mode: str) -> str:
+        return _digest(REPO / "package.json", REPO / "package-lock.json", extra=f"{mode}|{node}")
+
     marker = REPO / "node_modules" / ".ci-local-key"
-    if marker.exists() and marker.read_text() in {key, _digest(REPO / "package-lock.json", extra="full")} \
-            and not ctx.args.reinstall:
-        return  # a full install also satisfies an ignore-scripts request
+    wanted = key("ignore-scripts" if ignore_scripts else "full")
+    acceptable = {wanted, key("full")}  # a full install also satisfies an ignore-scripts request
+    if marker.exists() and marker.read_text() in acceptable and not ctx.args.reinstall:
+        # `npm ls` exits non-zero on extraneous or missing packages, e.g. after
+        # a local `npm install --no-save`, which `npm ci` would remove.
+        if subprocess.run(["npm", "ls", "--all"], cwd=REPO, capture_output=True).returncode == 0:
+            return
     cmd = ["npm", "ci", "--no-audit", "--no-fund"]
     if ignore_scripts:
         cmd.insert(2, "--ignore-scripts")
     ctx.run(cmd)
-    marker.write_text(key)
+    marker.write_text(wanted)
 
 
 def pinned_binary(ctx: Context, name: str, url: str, sha256: str, member: str | None) -> Path:
@@ -262,34 +346,47 @@ def pinned_binary(ctx: Context, name: str, url: str, sha256: str, member: str | 
     if dest.exists():
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(dir=dest.parent) as tmp:
         download = Path(tmp) / "asset"
         ctx.run(["curl", "-fsSL", "-o", str(download), url])
         actual = hashlib.sha256(download.read_bytes()).hexdigest()
         if actual != sha256:
             raise RuntimeError(f"{name}: checksum mismatch (expected {sha256}, got {actual})")
+        staged = Path(tmp) / "binary"
         if member:
-            with tarfile.open(download) as tar:
-                src = tar.extractfile(member)
-                if src is None:
-                    raise RuntimeError(f"{name}: {member} not found in {url}")
-                dest.write_bytes(src.read())
+            try:
+                with tarfile.open(download) as tar:
+                    src = tar.extractfile(member)
+                    if src is None:
+                        raise KeyError(member)
+                    staged.write_bytes(src.read())
+            except (KeyError, tarfile.TarError) as exc:
+                raise RuntimeError(f"{name}: could not extract {member} from {url}: {exc}") from exc
         else:
-            shutil.copyfile(download, dest)
-    dest.chmod(0o755)
+            shutil.copyfile(download, staged)
+        staged.chmod(0o755)
+        os.replace(staged, dest)  # atomic: an interrupted run never leaves a partial binary
     return dest
+
+
+def release_tool(ctx: Context, result: Result, name: str, version: str,
+                 url: str, sha256: str, member: str) -> str:
+    """The pinned linux-x86_64 build, or on other platforms a matching binary on PATH."""
+    if IS_LINUX_X86_64:
+        return str(pinned_binary(ctx, name, url, sha256, member))
+    exe = shutil.which(name)
+    if exe is None:
+        raise Skip(f"CI's pinned {name} build is linux-x86_64 only; install {name} {version} to run this check here")
+    found = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout.strip()
+    if version not in found:
+        result.parity.append(f"{name} on PATH is not v{version} ({found or 'unknown version'}).")
+    return exe
 
 
 def docker_running() -> bool:
     if shutil.which("docker") is None:
         return False
     return subprocess.run(["docker", "info"], capture_output=True).returncode == 0
-
-
-def git_output(*args: str) -> str:
-    return subprocess.run(
-        ["git", *args], cwd=REPO, capture_output=True, text=True, check=True
-    ).stdout.strip()
 
 
 # --------------------------------------------------------------------------
@@ -303,16 +400,23 @@ def check_python_syntax(ctx: Context, result: Result) -> None:
     ctx.run([*py, "scripts/build_frontend.py", "--check"])
 
 
+def node_check_files(globs: tuple[str, ...]) -> list[str]:
+    """Expand CI's bash globstar patterns in Python, so bash 4 is not required."""
+    files: list[str] = []
+    for pattern in globs:
+        files.extend(sorted(glob.glob(pattern, root_dir=REPO, recursive=True)))
+    return files
+
+
 def check_node_syntax(ctx: Context, result: Result) -> None:
     npm_install(ctx, ignore_scripts=True)
     ctx.run(["node", "scripts/check_frontend.mjs"])
-    globs = " ".join(ctx.pins.node_check_globs)
-    ctx.run(
-        "set -euo pipefail; shopt -s globstar nullglob; "
-        f'for f in {globs}; do node --check "$f"; done; '
-        "node --check scripts/check_frontend.mjs",
-        shell=True,
-    )
+    files = node_check_files(ctx.pins.node_check_globs)
+    print(f"  $ node --check  ({len(files)} files from {' '.join(ctx.pins.node_check_globs)})")
+    for path in files + ["scripts/check_frontend.mjs"]:
+        proc = subprocess.run(["node", "--check", path], cwd=REPO)
+        if proc.returncode != 0:
+            raise AssertionError(f"node --check failed for {path}")
     ctx.run(["node", "--test", "tests/frontendArchitecture.test.mjs"])
 
 
@@ -328,7 +432,7 @@ def check_pr_title(ctx: Context, result: Result) -> None:
     if not title:
         title = git_output("log", "-1", "--format=%s")
         result.parity.append("No --pr-title given; checked the HEAD commit subject instead.")
-    if not re.match(ctx.pins.pr_title_regex, title):
+    if not pr_title_ok(ctx.pins.pr_title_regex, title):
         raise AssertionError(f"PR title is not in Conventional Commits format: {title!r}")
     print(f"  PR title OK: {title}")
 
@@ -343,12 +447,25 @@ def check_gitleaks(ctx: Context, result: Result) -> None:
                 "(rerun with --unshallow to fetch the full history first)."
             )
     v = ctx.pins.gitleaks_version
-    binary = pinned_binary(
-        ctx, "gitleaks",
+    gitleaks = release_tool(
+        ctx, result, "gitleaks", v,
         f"https://github.com/gitleaks/gitleaks/releases/download/v{v}/gitleaks_{v}_linux_x64.tar.gz",
         ctx.pins.gitleaks_sha256, "gitleaks",
     )
-    ctx.run([str(binary), "git", "--no-banner", "--redact", "--verbose", "."])
+    flags = ["--no-banner", "--redact", "--verbose"]
+    ctx.run([gitleaks, "git", *flags, "."])  # what CI runs: the committed history
+    modified, untracked = tree_changes()
+    if modified:
+        # Content that CI will scan once it is committed: staged and unstaged changes.
+        ctx.run([gitleaks, "git", "--staged", *flags, "."])
+        ctx.run([gitleaks, "git", "--pre-commit", *flags, "."])
+    if untracked:
+        with tempfile.TemporaryDirectory() as tmp:
+            for rel in untracked:
+                target = Path(tmp) / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(REPO / rel, target)
+            ctx.run([gitleaks, "dir", *flags, "--config", str(REPO / ".gitleaks.toml"), tmp])
 
 
 def check_actionlint(ctx: Context, result: Result) -> None:
@@ -358,12 +475,12 @@ def check_actionlint(ctx: Context, result: Result) -> None:
             "checks that CI's runner (which has shellcheck) performs."
         )
     v = ctx.pins.actionlint_version
-    binary = pinned_binary(
-        ctx, "actionlint",
+    actionlint = release_tool(
+        ctx, result, "actionlint", v,
         f"https://github.com/rhysd/actionlint/releases/download/v{v}/actionlint_{v}_linux_amd64.tar.gz",
         ctx.pins.actionlint_sha256, "actionlint",
     )
-    ctx.run([str(binary), "-color"])
+    ctx.run([actionlint, "-color"])
 
 
 def check_zizmor(ctx: Context, result: Result) -> None:
@@ -377,16 +494,20 @@ def check_zizmor(ctx: Context, result: Result) -> None:
         ],
         key=_digest(REPO / "requirements-bootstrap.txt", extra=spec),
     )
-    py_base = find_python(ctx, ctx.pins.python_security)
-    ctx.run([*py_base, "scripts/check_ca_trust.py", "--system"])
+    ctx.run([str(py), "scripts/check_ca_trust.py", "--system"])
     ctx.run([str(py.parent / "zizmor"), "--offline", "--min-severity=low", ".github/workflows/"])
 
 
 def check_hadolint(ctx: Context, result: Result) -> None:
     ignores = [arg for rule in ctx.pins.hadolint_ignore for arg in ("--ignore", rule)]
     lint = ["--failure-threshold", "info", *ignores]
-    if docker_running():
-        ctx.run(f"docker run --rm -i {HADOLINT_IMAGE} hadolint {' '.join(lint)} - < Dockerfile", shell=True)
+    if IS_LINUX_X86_64:  # prefer the checksum-verified binary over a mutable image tag
+        binary = pinned_binary(
+            ctx, "hadolint",
+            f"https://github.com/hadolint/hadolint/releases/download/v{HADOLINT_VERSION}/hadolint-linux-x86_64",
+            HADOLINT_LINUX_X86_64_SHA256, None,
+        )
+        ctx.run([str(binary), *lint, "Dockerfile"])
         return
     exe = shutil.which("hadolint")
     if exe:
@@ -395,18 +516,15 @@ def check_hadolint(ctx: Context, result: Result) -> None:
             result.parity.append(f"hadolint on PATH is not v{HADOLINT_VERSION} ({version.strip()}).")
         ctx.run([exe, *lint, "Dockerfile"])
         return
-    if sys.platform != "linux" or os.uname().machine != "x86_64":
-        raise Skip("no Docker daemon or hadolint binary, and the pinned download is linux-x86_64 only")
-    binary = pinned_binary(
-        ctx, "hadolint",
-        f"https://github.com/hadolint/hadolint/releases/download/v{HADOLINT_VERSION}/hadolint-linux-x86_64",
-        HADOLINT_LINUX_X86_64_SHA256, None,
-    )
-    ctx.run([str(binary), *lint, "Dockerfile"])
+    if docker_running():
+        # The image hadolint-action's Dockerfile builds FROM, as CI uses it.
+        ctx.run(f"docker run --rm -i {HADOLINT_IMAGE} hadolint {' '.join(lint)} - < Dockerfile", shell=True)
+        return
+    raise Skip("no hadolint binary or Docker daemon, and the pinned download is linux-x86_64 only")
 
 
 def _bwrap_works() -> bool:
-    if shutil.which("bwrap") is None:
+    if shutil.which("bwrap") is None or shutil.which("timeout") is None:
         return False
     probe = subprocess.run(
         ["timeout", "3s", "bwrap", "--die-with-parent", "--unshare-pid", "--ro-bind", "/", "/",
@@ -416,51 +534,78 @@ def _bwrap_works() -> bool:
     return probe.returncode == 0
 
 
+def pytest_env() -> tuple[dict[str, str], list[str]]:
+    """The developer's environment minus variables a clean CI runner would not have."""
+    env = dict(os.environ)
+    dropped = []
+    for name in list(env):
+        if name in PYTEST_ENV_SCRUB or (name.startswith("ODYSSEUS_") and name != "ODYSSEUS_CI_CACHE"):
+            dropped.append(name)
+            del env[name]
+    return env, sorted(dropped)
+
+
 def check_python_tests(ctx: Context, result: Result) -> None:
     need("ffmpeg")
-    pins = ctx.pins
-    py_base = find_python(ctx, pins.python_tests)
-    ctx.run([*py_base, "scripts/check_ca_trust.py", "--system"])
-
-    bootstrap = str(REPO / "requirements-bootstrap.txt")
-    playwright = f"playwright=={pins.playwright}"
-    py = venv(
-        ctx, "tests", pins.python_tests,
-        [
-            pip_install("--require-hashes", "--only-binary=:all:", "--no-deps", "-r", bootstrap),
-            ["{py}", str(REPO / "scripts" / "check_ca_trust.py"), "--python"],
-            pip_install("-r", str(REPO / "requirements.txt")),
-            pip_install(playwright),
-        ],
-        key=_digest(REPO / "requirements-bootstrap.txt", REPO / "requirements.txt", extra=playwright),
-    )
-    npm_install(ctx, ignore_scripts=False)
-    browsers = ctx.cache / "ms-playwright"
-    browser_env = {"PLAYWRIGHT_BROWSERS_PATH": str(browsers)}
-    ctx.run(["npx", "playwright", "install", "chromium"], env=browser_env)
-    (REPO / "data").mkdir(exist_ok=True)
-    ctx.run([str(py), "scripts/check_ca_trust.py", "--system", "--python"])
-
     if not _bwrap_works():
+        if not ctx.args.without_bwrap:
+            raise Skip(
+                "bubblewrap is missing or its PID/mount-namespace probe failed, and CI refuses "
+                "to start pytest in that state (the containment tests would fail). Install "
+                "bubblewrap with unprivileged user namespaces enabled, or pass --without-bwrap "
+                "to run the suite anyway and expect containment failures"
+            )
         result.parity.append(
-            "bubblewrap is missing or its PID/mount-namespace probe failed. CI refuses to "
-            "start pytest in that state; here the suite ran with containment tests in "
-            "their reduced mode, so a pass is weaker than CI's."
+            "Ran without working bubblewrap (--without-bwrap). CI refuses to start pytest "
+            "in that state, and containment tests fail here for that reason alone."
         )
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         result.parity.append(
             "Running as root. CI runs as an unprivileged user, and some tests skip under root."
         )
 
+    pins = ctx.pins
+    check_uv_version(ctx)
+    bootstrap = str(REPO / "requirements-bootstrap.txt")
+    playwright = f"playwright=={pins.playwright}"
+    requirements = str(REPO / "requirements.txt")
+    # requirements.txt is mostly unpinned, and CI installs it into a fresh
+    # runner every time, getting the newest releases. Rebuilding this venv each
+    # day (or with --reinstall) keeps it close to that without upgrading the
+    # hash-pinned bootstrap packages, which CI never upgrades either.
+    day = time.strftime("%Y-%m-%d")
+    py = venv(
+        ctx, "tests", pins.python_tests,
+        [
+            pip_install("--require-hashes", "--only-binary=:all:", "--no-deps", "-r", bootstrap),
+            ["{py}", str(REPO / "scripts" / "check_ca_trust.py"), "--python"],
+            pip_install("-r", requirements),
+            pip_install(playwright),
+        ],
+        key=_digest(REPO / "requirements-bootstrap.txt", REPO / "requirements.txt",
+                    extra=f"{playwright}|{day}"),
+    )
+    ctx.run([str(py), "scripts/check_ca_trust.py", "--system"])
+    npm_install(ctx, ignore_scripts=False)
+    browsers = {"PLAYWRIGHT_BROWSERS_PATH": str(ctx.cache / "ms-playwright")}
+    ctx.run(["npx", "playwright", "install", "chromium"], env=browsers)
+    (REPO / "data").mkdir(exist_ok=True)
+    ctx.run([str(py), "scripts/check_ca_trust.py", "--system", "--python"])
+
+    base_env, dropped = pytest_env()
+    if dropped:
+        print(f"  (unset for pytest, as on a clean CI runner: {', '.join(dropped)})")
     # GitHub Actions sets these implicitly; the suite fails (instead of skipping)
     # browser and acorn tests when CI is set and their packages are missing.
-    env = {"CI": "true", "GITHUB_ACTIONS": "true", **browser_env}
+    env = {"CI": "true", "GITHUB_ACTIONS": "true", **browsers}
     shards = [ctx.args.shard] if ctx.args.shard else list(pins.shards)
+    if ctx.args.shard:
+        result.parity.append(f"Only pytest shard {ctx.args.shard} ran; CI runs all of {', '.join(pins.shards)}.")
     failed = []
     for shard in shards:  # fail-fast: false in CI, so every shard runs
         print(f"\n  -- pytest shard {shard}", flush=True)
         rc = ctx.run([str(py), "-m", "pytest", "-q", "-rs", "--durations=25", "--shard", shard],
-                     env=env, check=False)
+                     env=env, base_env=base_env, check=False)
         if rc != 0:
             failed.append(f"pytest shard {shard}")
 
@@ -470,7 +615,7 @@ def check_python_tests(ctx: Context, result: Result) -> None:
             ["npx", "--no-install", "playwright", "test",
              "--config", "tests/e2e/ios-layout.config.cjs", "--reporter=line"],
             env={**env, "ODYSSEUS_TEST_PYTHON": str(py), "ODYSSEUS_LAYOUT_BROWSER": "chromium"},
-            check=False,
+            base_env=base_env, check=False,
         )
         if rc != 0:
             failed.append("Playwright mobile layout checks")
@@ -530,6 +675,23 @@ NOT_RUN: dict[tuple[str, str], str] = {
     ("deploy-pages.yml", "deploy"): "GitHub-only Pages deployment.",
 }
 
+# A digest of each mirrored job's definition. tests/test_ci_local_harness.py
+# recomputes these from the workflow files; when a job changes, the test fails
+# until someone checks the matching check above still mirrors it and updates
+# the digest here.
+JOB_DIGESTS: dict[tuple[str, str], str] = {
+    ("ci.yml", "python-syntax"): "e9416416dcc5925a",
+    ("ci.yml", "node-syntax"): "55dfd13112cafc54",
+    ("ci.yml", "benchmark-gfm-security"): "99757f8a8db5c019",
+    ("pr-description-check.yml", "check-title"): "e52dcb3f71ec2c04",
+    ("secret-scan.yml", "gitleaks"): "e3fc5117ce0496fa",
+    ("workflow-security.yml", "actionlint"): "b10a7bab85e033f1",
+    ("workflow-security.yml", "zizmor"): "8ccfabd87badda45",
+    ("container-scan.yml", "hadolint"): "dd770a1359f96435",
+    ("ci.yml", "focused-test-guidance"): "253d96b48d618cfd",
+    ("ci.yml", "python-tests"): "e111dec31e88dbce",
+}
+
 
 # --------------------------------------------------------------------------
 # Main
@@ -547,8 +709,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--pr-title", help="PR title to check (default: the HEAD commit subject)")
     p.add_argument("--base", default="dev", help="base branch for focused test guidance (default: dev)")
     p.add_argument("--unshallow", action="store_true", help="fetch full git history before gitleaks, as CI scans it")
-    p.add_argument("--reinstall", action="store_true", help="rebuild cached venvs and node_modules")
-    p.add_argument("--strict", action="store_true", help="exit 1 if any blocking check was skipped")
+    p.add_argument("--without-bwrap", action="store_true",
+                   help="run the pytest suite even without working bubblewrap (CI refuses to)")
+    p.add_argument("--reinstall", action="store_true", help="rebuild cached venvs, node_modules and tool binaries")
+    p.add_argument("--strict", action="store_true",
+                   help="exit 1 unless every blocking check ran, with CI's coverage, and passed")
     args = p.parse_args(argv)
     for opt in ("only", "skip"):
         value = getattr(args, opt)
@@ -559,6 +724,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return args
 
 
+def select(args: argparse.Namespace) -> list[Check]:
+    only = set(args.only.split(",")) if args.only else None
+    skip = set(args.skip.split(",")) if args.skip else set()
+    chosen = []
+    for c in CHECKS:
+        if only is not None and c.name not in only:
+            continue
+        if c.name in skip:
+            continue
+        if args.quick and not c.quick and not (only and c.name in only):
+            continue
+        chosen.append(c)
+    return chosen
+
+
 def print_list(pins: Pins) -> None:
     print("Checks (run in this order):")
     for c in CHECKS:
@@ -566,12 +746,13 @@ def print_list(pins: Pins) -> None:
         extra = "" if c.quick else "   [not in --quick]"
         print(f"  {c.name:<14} {tag:<11} {c.ci_job}{extra}")
     print(f"\nPins read from .github/workflows/: Python {pins.python_tests} (tests), "
-          f"{pins.python_security} (zizmor), Node {pins.node}, gitleaks {pins.gitleaks_version}, "
-          f"actionlint {pins.actionlint_version}, zizmor {pins.zizmor}, "
-          f"shards {', '.join(pins.shards)}")
+          f"{pins.python_security} (zizmor), Node {pins.node}, uv {pins.uv}, "
+          f"gitleaks {pins.gitleaks_version}, actionlint {pins.actionlint_version}, "
+          f"zizmor {pins.zizmor}, shards {', '.join(pins.shards)}")
     print("\nCI jobs not run locally:")
+    width = max(len(f"{wf}:{job}") for wf, job in NOT_RUN)
     for (wf, job), why in NOT_RUN.items():
-        print(f"  {wf}:{job:<20} {why}")
+        print(f"  {f'{wf}:{job}':<{width}}  {why}")
 
 
 def main(argv: list[str]) -> int:
@@ -585,13 +766,12 @@ def main(argv: list[str]) -> int:
     if args.list:
         print_list(pins)
         return 0
-
-    selected = [c for c in CHECKS
-                if (not args.only or c.name in args.only.split(","))
-                and (not args.skip or c.name not in args.skip.split(","))
-                and (c.quick or not args.quick or (args.only and c.name in args.only.split(",")))]
     if args.shard and args.shard not in pins.shards:
         print(f"ci_local: --shard must be one of {', '.join(pins.shards)}", file=sys.stderr)
+        return 2
+    selected = select(args)
+    if not selected:
+        print("ci_local: no checks selected", file=sys.stderr)
         return 2
 
     ctx = Context(args, pins)
@@ -608,16 +788,21 @@ def main(argv: list[str]) -> int:
         except (subprocess.CalledProcessError, AssertionError, RuntimeError, OSError) as exc:
             result.status, result.detail = FAIL, str(exc)
         result.seconds = time.monotonic() - start
-        result.parity.extend(ctx.parity)
+        for note in ctx.parity:
+            if note not in result.parity:
+                result.parity.append(note)
         ctx.parity.clear()
-        print(f"--- {check.name}: {result.status}" + (f" ({result.detail})" if result.detail else ""))
+        label = "PASS*" if result.degraded else result.status
+        print(f"--- {check.name}: {label}" + (f" ({result.detail})" if result.detail else ""))
         results.append(result)
 
+    modified, untracked = tree_changes()
     print("\n" + "=" * 72)
     print("Summary")
     print("=" * 72)
     for r in results:
-        print(f"  {r.status:<4}  {r.name:<14} {r.seconds:6.1f}s  {r.ci_job}")
+        label = "PASS*" if r.degraded else r.status
+        print(f"  {label:<5} {r.name:<14} {r.seconds:6.1f}s  {r.ci_job}")
         if r.detail:
             print(f"        {r.detail}")
         for note in r.parity:
@@ -625,16 +810,30 @@ def main(argv: list[str]) -> int:
 
     failed = [r for r in results if r.blocking and r.status == FAIL]
     skipped = [r for r in results if r.blocking and r.status == SKIP]
+    degraded = [r for r in results if r.blocking and r.degraded]
+    not_selected = [c for c in CHECKS if c.blocking and c not in selected]
     print()
+    if modified or untracked:
+        print(f"Working tree differs from HEAD ({len(modified)} modified, {len(untracked)} untracked "
+              "file(s)). These checks read the files on disk; CI checks out only the commit.")
     if failed:
         print(f"{len(failed)} blocking check(s) FAILED: {', '.join(r.name for r in failed)}")
     if skipped:
         print(f"{len(skipped)} blocking check(s) did NOT run here: "
               f"{', '.join(r.name for r in skipped)}. This is not the same as green CI.")
-    if not failed and not skipped:
-        print("All selected blocking checks passed.")
+    if degraded:
+        print(f"{len(degraded)} blocking check(s) passed with weaker coverage than CI (PASS*): "
+              f"{', '.join(r.name for r in degraded)}.")
+    if not_selected:
+        print(f"Partial run: {len(not_selected)} blocking check(s) not selected: "
+              f"{', '.join(c.name for c in not_selected)}.")
+    if not (failed or skipped or degraded or not_selected):
+        print("All blocking checks passed with CI's coverage.")
+    elif not failed:
+        print("No selected blocking check failed.")
     print("CI jobs that never run locally are listed by --list.")
-    return 1 if failed or (args.strict and skipped) else 0
+    incomplete = bool(skipped or degraded or not_selected)
+    return 1 if failed or (args.strict and incomplete) else 0
 
 
 if __name__ == "__main__":
