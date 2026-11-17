@@ -498,6 +498,11 @@ def check_gfm_security(ctx: Context, result: Result) -> None:
 def check_pr_title(ctx: Context, result: Result) -> None:
     title = ctx.args.pr_title
     if not title:
+        # CI checks the pull request's title, never a commit. On a merge commit (for
+        # example dev after "Merge pull request #N") the subject is GitHub's merge
+        # message, which says nothing about a PR title, so there is nothing to check.
+        if len(git_output("rev-list", "--parents", "-n", "1", "HEAD").split()) > 2:
+            raise Skip("HEAD is a merge commit; pass --pr-title 'type(scope): summary' to check a title")
         title = git_output("log", "-1", "--format=%s")
         result.parity.append("No --pr-title given; checked the HEAD commit subject instead.")
     if not pr_title_ok(ctx.pins.pr_title_regex, title):
