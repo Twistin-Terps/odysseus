@@ -43,6 +43,7 @@ import argparse
 import glob
 import hashlib
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -67,10 +68,22 @@ HADOLINT_LINUX_X86_64_SHA256 = "eb8eb4dd06a068cce65cb84743fba69f09ed12a36ff13d58
 
 # The release assets CI downloads, and so the only ones with pinned checksums,
 # are linux-x86_64 builds.
-IS_LINUX_X86_64 = sys.platform == "linux" and os.uname().machine == "x86_64"
+IS_LINUX_X86_64 = sys.platform == "linux" and platform.machine() == "x86_64"
 
 # Variables that would steer pytest differently from a clean CI runner.
 PYTEST_ENV_SCRUB = ("PYTEST_ADDOPTS", "PYTEST_PLUGINS", "APP_PORT")
+# Prefixes of variables through which gitleaks, zizmor and hadolint read a
+# developer's own configuration; CI's runners set none of them.
+TOOL_ENV_PREFIXES = ("GITLEAKS_", "ZIZMOR_", "HADOLINT_")
+
+
+def clean_tool_env() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if not k.startswith(TOOL_ENV_PREFIXES)}
+
+
+def version_of(text: str) -> str | None:
+    match = re.search(r"\bv?(\d+\.\d+\.\d+)\b", text)
+    return match.group(1) if match else None
 
 
 # --------------------------------------------------------------------------
@@ -240,15 +253,27 @@ def git_output(*args: str) -> str:
 
 
 def tree_changes() -> tuple[list[str], list[str]]:
-    """Return (modified or staged tracked paths, untracked non-ignored paths)."""
-    out = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=all"],
-        cwd=REPO, capture_output=True, text=True, check=True,
-    ).stdout
-    modified, untracked = [], []
-    for line in out.splitlines():
-        (untracked if line.startswith("??") else modified).append(line[3:])
-    return modified, untracked
+    """Return (modified or staged tracked paths, untracked non-ignored paths).
+
+    Uses NUL-separated output, so paths with spaces or non-ASCII characters
+    arrive unquoted.
+    """
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "-z", "--untracked-files=no"],
+        cwd=REPO, capture_output=True, check=True,
+    ).stdout.decode("utf-8", "surrogateescape").split("\0")
+    modified, entries = [], iter(status)
+    for entry in entries:
+        if not entry:
+            continue
+        modified.append(entry[3:])
+        if entry[0] in "RC":  # renames and copies carry the old path as a second field
+            next(entries, None)
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=REPO, capture_output=True, check=True,
+    ).stdout.decode("utf-8", "surrogateescape").split("\0")
+    return modified, [u for u in untracked if u]
 
 
 # --------------------------------------------------------------------------
@@ -266,13 +291,20 @@ def find_python(ctx: Context, version: str) -> list[str]:
             return [exe]
     if shutil.which("uv") is None:
         raise Skip(f"Python {version} is needed (CI pins it) and neither python{version} nor uv is installed")
+    # A Python uv already manages, in its default location, is fine to reuse.
+    found = subprocess.run(["uv", "python", "find", version], capture_output=True, text=True)
+    if found.returncode == 0:
+        return [found.stdout.strip()]
+    # Otherwise install one into the cache (UV_PYTHON_BIN_DIR keeps its shims there too).
     env = {**os.environ, **ctx.uv_env()}
     found = subprocess.run(["uv", "python", "find", version], capture_output=True, text=True, env=env)
-    if found.returncode != 0:
-        install = subprocess.run(["uv", "python", "install", "--no-bin", version], env=env)
-        found = subprocess.run(["uv", "python", "find", version], capture_output=True, text=True, env=env)
-        if install.returncode != 0 or found.returncode != 0:
-            raise Skip(f"Python {version} is needed and uv could not install it (offline?)")
+    if found.returncode == 0:
+        return [found.stdout.strip()]
+    install = subprocess.run(["uv", "python", "install", version], capture_output=True, text=True, env=env)
+    found = subprocess.run(["uv", "python", "find", version], capture_output=True, text=True, env=env)
+    if install.returncode != 0 or found.returncode != 0:
+        reason = (install.stderr or found.stderr).strip().splitlines()[-1:] or ["unknown error"]
+        raise Skip(f"Python {version} is needed and uv could not install it: {reason[0]}")
     return [found.stdout.strip()]
 
 
@@ -293,11 +325,14 @@ def check_uv_version(ctx: Context) -> None:
         ctx.note(f"uv is {found}; CI pins uv {ctx.pins.uv}.")
 
 
-def venv(ctx: Context, label: str, version: str, steps: list[list[str]], key: str) -> Path:
+def venv(ctx: Context, label: str, version: str, steps: list[list[str]], key: str,
+         result: Result | None = None) -> Path:
     """Create or reuse a cached venv and return its python.
 
-    The venv is rebuilt from scratch, running `steps`, whenever `key` changes
-    or --reinstall is given.
+    The venv is rebuilt, running `steps`, whenever `key` changes or --reinstall
+    is given. The old venv is moved aside first and deleted only once every
+    step has succeeded; if the rebuild fails, the old venv is put back and
+    used, and the result gets a note saying its dependencies may be older.
     """
     root = ctx.cache / f"venv-{label}-py{version}"
     py = root / "bin" / "python"
@@ -305,11 +340,28 @@ def venv(ctx: Context, label: str, version: str, steps: list[list[str]], key: st
     if py.exists() and marker.exists() and marker.read_text() == key and not ctx.args.reinstall:
         return py
     base_python = find_python(ctx, version)
+    backup = root.with_name(root.name + ".previous")
+    if backup.exists():
+        shutil.rmtree(backup)
     if root.exists():
-        shutil.rmtree(root)
-    ctx.run([*base_python, "-m", "venv", str(root)])
-    for step in steps:
-        ctx.run([str(py) if part == "{py}" else part for part in step], env=ctx.uv_env())
+        root.rename(backup)
+    try:
+        ctx.run([*base_python, "-m", "venv", str(root)])
+        for step in steps:
+            ctx.run([str(py) if part == "{py}" else part for part in step], env=ctx.uv_env())
+    except (subprocess.CalledProcessError, OSError) as exc:
+        shutil.rmtree(root, ignore_errors=True)
+        if not backup.exists():
+            raise
+        backup.rename(root)  # never lose a working venv to a failed rebuild
+        if result is not None:
+            result.parity.append(
+                f"Could not rebuild the {label} environment ({exc}); used the existing one, "
+                "whose dependencies may be older than CI's."
+            )
+            return py
+        raise
+    shutil.rmtree(backup, ignore_errors=True)
     marker.write_text(key)
     return py
 
@@ -378,7 +430,7 @@ def release_tool(ctx: Context, result: Result, name: str, version: str,
     if exe is None:
         raise Skip(f"CI's pinned {name} build is linux-x86_64 only; install {name} {version} to run this check here")
     found = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout.strip()
-    if version not in found:
+    if version_of(found) != version:
         result.parity.append(f"{name} on PATH is not v{version} ({found or 'unknown version'}).")
     return exe
 
@@ -400,11 +452,27 @@ def check_python_syntax(ctx: Context, result: Result) -> None:
     ctx.run([*py, "scripts/build_frontend.py", "--check"])
 
 
+def _through_symlinked_dir(rel: str) -> bool:
+    parts = Path(rel).parts[:-1]
+    return any((REPO.joinpath(*parts[: i + 1])).is_symlink() for i in range(len(parts)))
+
+
 def node_check_files(globs: tuple[str, ...]) -> list[str]:
-    """Expand CI's bash globstar patterns in Python, so bash 4 is not required."""
+    """Expand CI's `shopt -s globstar nullglob` patterns the way bash does.
+
+    A pattern without glob characters is passed through even when the file is
+    missing (nullglob only drops patterns that are globs), so a deleted file
+    fails here as it does in CI. Like bash globstar, `**` does not descend
+    into symlinked directories. Done in Python so bash 4 is not required.
+    """
     files: list[str] = []
     for pattern in globs:
-        files.extend(sorted(glob.glob(pattern, root_dir=REPO, recursive=True)))
+        if not any(ch in pattern for ch in "*?["):
+            files.append(pattern)
+            continue
+        matches = glob.glob(str(REPO / pattern), recursive=True)
+        rels = sorted(os.path.relpath(m, REPO) for m in matches)
+        files.extend(r for r in rels if not _through_symlinked_dir(r))
     return files
 
 
@@ -452,20 +520,30 @@ def check_gitleaks(ctx: Context, result: Result) -> None:
         f"https://github.com/gitleaks/gitleaks/releases/download/v{v}/gitleaks_{v}_linux_x64.tar.gz",
         ctx.pins.gitleaks_sha256, "gitleaks",
     )
-    flags = ["--no-banner", "--redact", "--verbose"]
-    ctx.run([gitleaks, "git", *flags, "."])  # what CI runs: the committed history
+    # CI loads .gitleaks.toml from the scanned repository; pass it explicitly so
+    # a GITLEAKS_CONFIG in the developer's environment cannot replace it.
+    config = str(REPO / ".gitleaks.toml")
+    flags = ["--no-banner", "--redact", "--verbose", "--config", config]
+    env = clean_tool_env()
+    ctx.run([gitleaks, "git", *flags, "."], base_env=env)  # what CI runs: the committed history
     modified, untracked = tree_changes()
     if modified:
-        # Content that CI will scan once it is committed: staged and unstaged changes.
-        ctx.run([gitleaks, "git", "--staged", *flags, "."])
-        ctx.run([gitleaks, "git", "--pre-commit", *flags, "."])
-    if untracked:
+        # Content CI will scan once it is committed: staged and unstaged changes.
+        ctx.run([gitleaks, "git", "--staged", *flags, "."], base_env=env)
+        ctx.run([gitleaks, "git", "--pre-commit", *flags, "."], base_env=env)
+    regular = [u for u in untracked if (REPO / u).is_file() and not (REPO / u).is_symlink()]
+    if len(regular) != len(untracked):
+        result.parity.append(
+            f"{len(untracked) - len(regular)} untracked entries that are not regular files "
+            "(symlinks, nested repositories) were not scanned."
+        )
+    if regular:
         with tempfile.TemporaryDirectory() as tmp:
-            for rel in untracked:
+            for rel in regular:
                 target = Path(tmp) / rel
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(REPO / rel, target)
-            ctx.run([gitleaks, "dir", *flags, "--config", str(REPO / ".gitleaks.toml"), tmp])
+            ctx.run([gitleaks, "dir", *flags, tmp], base_env=env)
 
 
 def check_actionlint(ctx: Context, result: Result) -> None:
@@ -495,30 +573,40 @@ def check_zizmor(ctx: Context, result: Result) -> None:
         key=_digest(REPO / "requirements-bootstrap.txt", extra=spec),
     )
     ctx.run([str(py), "scripts/check_ca_trust.py", "--system"])
-    ctx.run([str(py.parent / "zizmor"), "--offline", "--min-severity=low", ".github/workflows/"])
+    ctx.run([str(py.parent / "zizmor"), "--offline", "--min-severity=low", ".github/workflows/"],
+            base_env=clean_tool_env())
 
 
 def check_hadolint(ctx: Context, result: Result) -> None:
     ignores = [arg for rule in ctx.pins.hadolint_ignore for arg in ("--ignore", rule)]
-    lint = ["--failure-threshold", "info", *ignores]
-    if IS_LINUX_X86_64:  # prefer the checksum-verified binary over a mutable image tag
-        binary = pinned_binary(
-            ctx, "hadolint",
-            f"https://github.com/hadolint/hadolint/releases/download/v{HADOLINT_VERSION}/hadolint-linux-x86_64",
-            HADOLINT_LINUX_X86_64_SHA256, None,
-        )
-        ctx.run([str(binary), *lint, "Dockerfile"])
-        return
-    exe = shutil.which("hadolint")
-    if exe:
-        version = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout
-        if HADOLINT_VERSION not in version:
-            result.parity.append(f"hadolint on PATH is not v{HADOLINT_VERSION} ({version.strip()}).")
-        ctx.run([exe, *lint, "Dockerfile"])
-        return
+    env = clean_tool_env()
+    with tempfile.TemporaryDirectory() as tmp:
+        # The repo has no .hadolint.yaml and CI's action container has no user
+        # config; an empty config keeps ~/.config/hadolint.yaml out as well.
+        empty = Path(tmp) / "hadolint.yaml"
+        empty.write_text("{}\n")
+        lint = ["--config", str(empty), "--failure-threshold", "info", *ignores]
+        if IS_LINUX_X86_64:  # prefer the checksum-verified binary over a mutable image tag
+            binary = pinned_binary(
+                ctx, "hadolint",
+                f"https://github.com/hadolint/hadolint/releases/download/v{HADOLINT_VERSION}/hadolint-linux-x86_64",
+                HADOLINT_LINUX_X86_64_SHA256, None,
+            )
+            ctx.run([str(binary), *lint, "Dockerfile"], base_env=env)
+            return
+        exe = shutil.which("hadolint")
+        if exe:
+            version = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout
+            if version_of(version) != HADOLINT_VERSION:
+                result.parity.append(f"hadolint on PATH is not v{HADOLINT_VERSION} ({version.strip()}).")
+            ctx.run([exe, *lint, "Dockerfile"], base_env=env)
+            return
     if docker_running():
-        # The image hadolint-action's Dockerfile builds FROM, as CI uses it.
-        ctx.run(f"docker run --rm -i {HADOLINT_IMAGE} hadolint {' '.join(lint)} - < Dockerfile", shell=True)
+        # The image hadolint-action's Dockerfile builds FROM, as CI uses it; a
+        # fresh container has no user config.
+        ignore_args = " ".join(f"--ignore {rule}" for rule in ctx.pins.hadolint_ignore)
+        ctx.run(f"docker run --rm -i {HADOLINT_IMAGE} hadolint --failure-threshold info "
+                f"{ignore_args} - < Dockerfile", shell=True)
         return
     raise Skip("no hadolint binary or Docker daemon, and the pinned download is linux-x86_64 only")
 
@@ -565,6 +653,8 @@ def check_python_tests(ctx: Context, result: Result) -> None:
         )
 
     pins = ctx.pins
+    # As in CI, establish system trust before any installer runs.
+    ctx.run([*find_python(ctx, pins.python_tests), "scripts/check_ca_trust.py", "--system"])
     check_uv_version(ctx)
     bootstrap = str(REPO / "requirements-bootstrap.txt")
     playwright = f"playwright=={pins.playwright}"
@@ -584,8 +674,8 @@ def check_python_tests(ctx: Context, result: Result) -> None:
         ],
         key=_digest(REPO / "requirements-bootstrap.txt", REPO / "requirements.txt",
                     extra=f"{playwright}|{day}"),
+        result=result,
     )
-    ctx.run([str(py), "scripts/check_ca_trust.py", "--system"])
     npm_install(ctx, ignore_scripts=False)
     browsers = {"PLAYWRIGHT_BROWSERS_PATH": str(ctx.cache / "ms-playwright")}
     ctx.run(["npx", "playwright", "install", "chromium"], env=browsers)
@@ -787,6 +877,8 @@ def main(argv: list[str]) -> int:
             result.status, result.detail = SKIP, str(exc)
         except (subprocess.CalledProcessError, AssertionError, RuntimeError, OSError) as exc:
             result.status, result.detail = FAIL, str(exc)
+        except Exception as exc:  # a harness bug must not hide the other checks' results
+            result.status, result.detail = FAIL, f"internal error: {type(exc).__name__}: {exc}"
         result.seconds = time.monotonic() - start
         for note in ctx.parity:
             if note not in result.parity:
@@ -796,7 +888,11 @@ def main(argv: list[str]) -> int:
         print(f"--- {check.name}: {label}" + (f" ({result.detail})" if result.detail else ""))
         results.append(result)
 
-    modified, untracked = tree_changes()
+    try:
+        modified, untracked = tree_changes()
+        tree_known = True
+    except (subprocess.CalledProcessError, OSError):
+        modified, untracked, tree_known = [], [], False
     print("\n" + "=" * 72)
     print("Summary")
     print("=" * 72)
@@ -813,7 +909,9 @@ def main(argv: list[str]) -> int:
     degraded = [r for r in results if r.blocking and r.degraded]
     not_selected = [c for c in CHECKS if c.blocking and c not in selected]
     print()
-    if modified or untracked:
+    if not tree_known:
+        print("Could not read the git working tree state, so uncommitted changes were not checked.")
+    elif modified or untracked:
         print(f"Working tree differs from HEAD ({len(modified)} modified, {len(untracked)} untracked "
               "file(s)). These checks read the files on disk; CI checks out only the commit.")
     if failed:

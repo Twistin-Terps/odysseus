@@ -192,3 +192,89 @@ def test_bad_selections_are_usage_errors(argv, tmp_path):
     env = {**os.environ, "ODYSSEUS_CI_CACHE": str(tmp_path)}
     proc = subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True, env=env)
     assert proc.returncode == 2, proc.stderr
+
+
+def _git(cwd, *args):
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
+                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"})
+
+
+def test_tree_changes_reads_unusual_paths_unquoted(harness, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "tracked.txt").write_text("a\n")
+    _git(repo, "add", "tracked.txt")
+    _git(repo, "commit", "-qm", "init")
+    (repo / "tracked.txt").write_text("b\n")
+    (repo / "a b.txt").write_text("x\n")
+    (repo / "sub dir").mkdir()
+    (repo / "sub dir" / "café.txt").write_text("x\n")
+    monkeypatch.setattr(harness, "REPO", repo)
+    modified, untracked = harness.tree_changes()
+    assert modified == ["tracked.txt"]
+    assert sorted(untracked) == ["a b.txt", "sub dir/café.txt"]
+
+
+def test_node_check_files_keeps_literals_and_skips_symlinked_dirs(harness, tmp_path, monkeypatch):
+    (tmp_path / "static" / "js" / "real").mkdir(parents=True)
+    (tmp_path / "static" / "js" / "real" / "a.js").write_text("")
+    (tmp_path / "elsewhere" / "deep").mkdir(parents=True)
+    (tmp_path / "elsewhere" / "deep" / "e.js").write_text("")
+    (tmp_path / "static" / "js" / "link").symlink_to(tmp_path / "elsewhere")
+    monkeypatch.setattr(harness, "REPO", tmp_path)
+    files = harness.node_check_files(("static/missing.js", "static/js/**/*.js"))
+    # bash nullglob keeps a literal word even when the file is missing, and
+    # globstar does not descend into symlinked directories.
+    assert files == ["static/missing.js", "static/js/real/a.js"]
+
+
+@pytest.mark.parametrize("text, version", [
+    ("gitleaks version 8.30.1", "8.30.1"),
+    ("8.30.10", "8.30.10"),
+    ("Haskell Dockerfile Linter v2.15.0", "2.15.0"),
+    ("unknown", None),
+])
+def test_version_of_extracts_exact_versions(harness, text, version):
+    assert harness.version_of(text) == version
+
+
+def test_tool_env_drops_developer_config(harness, monkeypatch):
+    monkeypatch.setenv("GITLEAKS_CONFIG", "/tmp/other.toml")
+    monkeypatch.setenv("ZIZMOR_CONFIG", "/tmp/z.yml")
+    monkeypatch.setenv("HADOLINT_NOFAIL", "1")
+    env = harness.clean_tool_env()
+    assert not any(k.startswith(("GITLEAKS_", "ZIZMOR_", "HADOLINT_")) for k in env)
+    assert env["PATH"] == os.environ["PATH"]
+
+
+def test_failed_venv_rebuild_restores_the_previous_venv(harness, tmp_path, monkeypatch):
+    class Args:
+        reinstall = False
+
+    class FakeCtx:
+        args = Args()
+        cache = tmp_path
+
+        def uv_env(self):
+            return {}
+
+        def run(self, cmd, **kwargs):
+            if cmd[1:3] == ["-m", "venv"]:
+                (Path(cmd[3]) / "bin").mkdir(parents=True)
+                (Path(cmd[3]) / "bin" / "python").write_text("new")
+                return 0
+            raise subprocess.CalledProcessError(1, cmd)
+
+    old = tmp_path / "venv-tests-py3.11"
+    (old / "bin").mkdir(parents=True)
+    (old / "bin" / "python").write_text("old")
+    (old / ".ci-local-key").write_text("yesterday")
+    monkeypatch.setattr(harness, "find_python", lambda ctx, version: ["python3"])
+    result = harness.Result("python-tests", "CI", True)
+    py = harness.venv(FakeCtx(), "tests", "3.11", [["{py}", "-m", "pip", "install", "x"]],
+                      key="today", result=result)
+    assert py.read_text() == "old"
+    assert any("Could not rebuild" in note for note in result.parity)
+    assert (old / ".ci-local-key").read_text() == "yesterday"
