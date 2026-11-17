@@ -820,6 +820,12 @@ VARIABLE_NOTES: dict[str, tuple[str, str, str]] = {
         "Fixed port for the test suite's static server. Unset takes an ephemeral "
         "port, which is what keeps parallel runs from colliding.",
     ),
+    "ODYSSEUS_CI_CACHE": (
+        "Testing, capture and development tooling", INTERNAL,
+        "Directory the local CI harness keeps its venvs, Playwright browsers and "
+        "pinned tool binaries in. Falls back to `odysseus-ci-local` under "
+        "`$XDG_CACHE_HOME`, or `~/.cache` when that is unset.",
+    ),
     "ODYSSEUS_SFT_TRACE_CAPTURE": (
         "Testing, capture and development tooling", INTERNAL,
         "On by default, but only for owners whose name starts with `sft_`. Set 0, "
