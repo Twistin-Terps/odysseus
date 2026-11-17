@@ -1956,9 +1956,12 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
     # lookback finds this write). One-shot calls skip it: no reuse would pay
     # back the cache-write premium.
     if tools or len(chat_messages) >= 3:
-        reserved = sum("cache_control" in b for b in payload.get("system", []) if isinstance(b, dict))
-        reserved += sum("cache_control" in t for t in payload.get("tools", []))
-        _mark_last_message_cache_breakpoint(chat_messages, reserved)
+        _mark_last_message_cache_breakpoint(chat_messages)
+    # The 4-breakpoint cap applies to every request: caller-marked blocks can
+    # exceed it even on a short call that gets no conversation breakpoint.
+    reserved = sum("cache_control" in b for b in payload.get("system", []) if isinstance(b, dict))
+    reserved += sum("cache_control" in t for t in payload.get("tools", []))
+    _cap_message_cache_breakpoints(chat_messages, reserved)
     return payload
 
 
@@ -1967,40 +1970,70 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
 _ANTHROPIC_CACHEABLE_BLOCK_TYPES = {"text", "image", "document", "tool_use", "tool_result"}
 
 
-def _mark_last_message_cache_breakpoint(chat_messages, reserved=0):
+def _count_cache_breakpoints(blocks):
+    """Breakpoints in a content list, counting those on blocks nested in a
+    tool_result's own `content` list (the API counts those too)."""
+    n = 0
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "tool_result" and isinstance(b.get("content"), list):
+            n += _count_cache_breakpoints(b["content"])
+        n += "cache_control" in b
+    return n
+
+
+def _strip_cache_breakpoints(blocks, excess):
+    """Return (copy of `blocks` with up to `excess` breakpoints removed oldest
+    first, remaining excess). Blocks nested in a tool_result precede that
+    block's own breakpoint in the prompt, so they go first. Never mutates."""
+    blocks = list(blocks)
+    for i, b in enumerate(blocks):
+        if excess <= 0:
+            break
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "tool_result" and isinstance(b.get("content"), list) \
+                and _count_cache_breakpoints(b["content"]):
+            inner, excess = _strip_cache_breakpoints(b["content"], excess)
+            b = {**b, "content": inner}
+        if excess > 0 and "cache_control" in b:
+            b = {k: v for k, v in b.items() if k != "cache_control"}
+            excess -= 1
+        blocks[i] = b
+    return blocks, excess
+
+
+def _cap_message_cache_breakpoints(chat_messages, reserved=0):
+    """Keep the request within the API's 4 breakpoints. `reserved` is the
+    number of system/tool breakpoints already in the payload; those are kept,
+    and the oldest message breakpoints are stripped (on copies) to fit."""
+    excess = reserved - 4 + sum(
+        _count_cache_breakpoints(m["content"])
+        for m in chat_messages if isinstance(m.get("content"), list)
+    )
+    for mi, msg in enumerate(chat_messages):
+        if excess <= 0:
+            break
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        blocks, excess = _strip_cache_breakpoints(content, excess)
+        chat_messages[mi] = {**msg, "content": blocks}
+
+
+def _mark_last_message_cache_breakpoint(chat_messages):
     """Put one ephemeral cache breakpoint on the last cacheable block of the
     final message. Copies the message and block it changes, so the caller's
     history never accumulates breakpoints across rounds (the API allows 4).
-    `reserved` is the number of system/tool breakpoints already in the payload;
-    if the caller pre-marked message blocks, the oldest are stripped (on copies)
-    so the request total stays within 4."""
+    Adds none if the caller pre-marked any top-level message block."""
     if not chat_messages:
         return
-    caller_marked = False
-    for msg in chat_messages:
-        content = msg.get("content")
-        if isinstance(content, list) and any(
-            isinstance(b, dict) and "cache_control" in b for b in content
-        ):
-            caller_marked = True
-    if caller_marked:  # caller placed its own message breakpoints: add none
-        excess = reserved + sum(
-            isinstance(b, dict) and "cache_control" in b
-            for m in chat_messages if isinstance(m.get("content"), list)
-            for b in m["content"]
-        ) - 4
-        for mi, msg in enumerate(chat_messages):
-            if excess <= 0:
-                break
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            blocks = list(content)
-            for bi, b in enumerate(blocks):
-                if excess > 0 and isinstance(b, dict) and "cache_control" in b:
-                    blocks[bi] = {k: v for k, v in b.items() if k != "cache_control"}
-                    excess -= 1
-            chat_messages[mi] = {**msg, "content": blocks}
+    if any(
+        isinstance(msg.get("content"), list)
+        and any(isinstance(b, dict) and "cache_control" in b for b in msg["content"])
+        for msg in chat_messages
+    ):  # caller placed its own message breakpoints: add none
         return
     last = chat_messages[-1]
     content = last.get("content")
