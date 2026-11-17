@@ -217,6 +217,48 @@ def test_tree_changes_reads_unusual_paths_unquoted(harness, tmp_path, monkeypatc
     assert sorted(untracked) == ["a b.txt", "sub dir/café.txt"]
 
 
+def test_pr_title_without_a_title_skips_on_a_merge_commit(harness, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "a.txt").write_text("a\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-qm", "fix(a): first")
+    _git(repo, "checkout", "-qb", "topic")
+    (repo / "b.txt").write_text("b\n")
+    _git(repo, "add", "b.txt")
+    _git(repo, "commit", "-qm", "feat(b): second")
+    _git(repo, "checkout", "-q", "main")
+    (repo / "c.txt").write_text("c\n")
+    _git(repo, "add", "c.txt")
+    _git(repo, "commit", "-qm", "fix(c): third")
+    monkeypatch.setattr(harness, "REPO", repo)
+
+    class Args:
+        pr_title = None
+
+    class Ctx:
+        args = Args()
+        pins = harness.read_pins()
+
+    # A plain commit: its subject is checked, with a parity note.
+    result = harness.Result("pr-title", "x", True)
+    harness.check_pr_title(Ctx(), result)
+    assert any("HEAD commit subject" in note for note in result.parity)
+
+    # A merge commit ("Merge pull request #N ...") is not a PR title: SKIP, not FAIL.
+    _git(repo, "merge", "-q", "--no-ff", "-m", "Merge pull request #1 from x/topic", "topic")
+    with pytest.raises(harness.Skip):
+        harness.check_pr_title(Ctx(), harness.Result("pr-title", "x", True))
+
+    # An explicit --pr-title is still checked on a merge commit.
+    Args.pr_title = "Merge pull request #1 from x/topic"
+    with pytest.raises(AssertionError):
+        harness.check_pr_title(Ctx(), harness.Result("pr-title", "x", True))
+    Args.pr_title = "fix(harness): skip the title check on merge commits"
+    harness.check_pr_title(Ctx(), harness.Result("pr-title", "x", True))
+
+
 def test_node_check_files_keeps_literals_and_skips_symlinked_dirs(harness, tmp_path, monkeypatch):
     (tmp_path / "static" / "js" / "real").mkdir(parents=True)
     (tmp_path / "static" / "js" / "real" / "a.js").write_text("")
