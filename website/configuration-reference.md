@@ -21,7 +21,7 @@ described as a switch that turns something off, the read rejects `0`, `false`,
 `no` and `off` and treats everything else as on. The `Default` column is the
 value the code falls back to when the variable is unset, quoted from the source.
 
-The source tree reads **149** `ODYSSEUS_*` variables: 92 an operator may want to set, and 57 that are internal - sentinels, fixture switches, capture hooks and development tooling. The internal ones are listed too, in their own section, so this page can be checked against the source mechanically.
+The source tree reads **150** `ODYSSEUS_*` variables: 92 an operator may want to set, and 58 that are internal - sentinels, fixture switches, capture hooks and development tooling. The internal ones are listed too, in their own section, so this page can be checked against the source mechanically.
 
 > This page is generated. Edit `scripts/generate_env_reference.py` and
 > re-run it; `tests/test_env_reference.py` enforces that the committed page
@@ -250,6 +250,7 @@ Listed for completeness. Setting one of these on a real install is either a no-o
 |---|---|---|---|
 | `ODYSSEUS_AJAX_TEST_URL` | *unset* | `tests/test_ajax_email_live.py` (+2 more) | Chat-completions URL of a live Ajax endpoint. Unset skips the opt-in live Ajax email tests. |
 | `ODYSSEUS_BROWSER_LIVE_CONTRACT` | *unset* | `tests/test_browser_producer_live_contract.py` | Set 1 only in the allowlisted release Docker environment to run the browser producer contract tests. Does not enable browser page operations. |
+| `ODYSSEUS_CI_CACHE` | *unset* | `scripts/ci_local.py` | Directory the local CI harness keeps its venvs, Playwright browsers and pinned tool binaries in. Falls back to `odysseus-ci-local` under `$XDG_CACHE_HOME`, or `~/.cache` when that is unset. |
 | `ODYSSEUS_DOCKER_TEST_IMAGE` | `'odysseus-odysseus:latest'` | `tests/test_docker_devops_hardening.py` | Docker image tag exercised by the DevOps Docker entrypoint integration tests. |
 | `ODYSSEUS_EDITOR_ACTIONS` | `','.join([*actions, 'edit', 'update'])` | `tests/tools/editor_writing_smoke.py` | Comma-separated writing actions the editor-writing smoke tool runs. Unset runs every action plus edit and update. |
 | `ODYSSEUS_EDITOR_MAX_TOKENS` | `'4096'` | `tests/tools/editor_writing_smoke.py` | Completion token limit for each editor-writing smoke request. |
@@ -302,7 +303,7 @@ reads three ways, because no single pattern covers the codebase:
   lines, so one read lives inside a string literal.
 
 The three passes are not redundancy. A line-based grep for a direct
-`os.environ.get("ODYSSEUS_...` call finds 117 of the 149 variables on this
+`os.environ.get("ODYSSEUS_...` call finds 118 of the 150 variables on this
 page. What it misses is reads through an env-reader helper, reads whose call
 spans more than one line, reads whose variable name is held in a module
 constant, and reads through a mapping passed in as an argument - which is the
