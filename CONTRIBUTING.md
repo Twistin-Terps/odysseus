@@ -52,6 +52,16 @@ python -m py_compile app.py routes/*.py src/*.py
 node --check static/js/<file-you-changed>.js
 ```
 
+To run the same blocking checks CI runs, with the versions pinned in `.github/workflows/`, use the local harness:
+
+```bash
+python3 scripts/ci_local.py --quick   # syntax, frontend, secret scan, workflow lint, Dockerfile lint (a few minutes)
+python3 scripts/ci_local.py           # all of the above plus every pytest shard
+python3 scripts/ci_local.py --list    # which CI job each check mirrors, and which jobs only run on GitHub
+```
+
+It installs what it needs into `~/.cache/odysseus-ci-local` and never uses sudo. A check it cannot run here is reported as SKIP, not as a pass.
+
 For Docker-related changes:
 
 ```bash
