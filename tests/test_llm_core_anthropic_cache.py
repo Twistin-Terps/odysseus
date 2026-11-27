@@ -216,3 +216,109 @@ def test_five_caller_markers_without_tools_capped_at_four_drops_oldest():
     assert "cache_control" not in blocks[0]
     assert all("cache_control" in b for b in blocks[1:])
     assert messages == before
+
+
+def test_short_call_without_tools_caps_five_caller_markers_drops_oldest():
+    messages = _marked_msgs(5)
+    before = copy.deepcopy(messages)
+    p = llm_core._build_anthropic_payload("claude", messages, 0.0, 1000, stream=True, tools=None)
+    assert _all_breakpoints(p) == 4
+    blocks = p["messages"][-1]["content"]
+    assert "cache_control" not in blocks[0]
+    assert all("cache_control" in b for b in blocks[1:])
+    assert messages == before
+
+
+def test_short_call_long_system_plus_four_caller_markers_keeps_system_drops_oldest():
+    messages = [{"role": "system", "content": "s" * 5000}] + _marked_msgs(4)
+    before = copy.deepcopy(messages)
+    p = llm_core._build_anthropic_payload("claude", messages, 0.0, 1000, stream=True, tools=None)
+    assert _all_breakpoints(p) == 4
+    assert p["system"][0].get("cache_control") == {"type": "ephemeral"}
+    blocks = p["messages"][-1]["content"]
+    assert "cache_control" not in blocks[0]
+    assert all("cache_control" in b for b in blocks[1:])
+    assert messages == before
+
+
+def test_short_call_within_cap_leaves_caller_markers_and_adds_none():
+    marked = {"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}}
+    messages = [
+        {"role": "user", "content": [dict(marked)]},
+        {"role": "assistant", "content": [dict(marked, text="b")]},
+    ]
+    before = copy.deepcopy(messages)
+    p = llm_core._build_anthropic_payload("claude", messages, 0.0, 1000, stream=True, tools=None)
+    assert _all_breakpoints(p) == 2
+    assert [m["content"] for m in p["messages"]] == [m["content"] for m in before]
+
+
+def _nested_breakpoints(p):
+    return sum(
+        isinstance(inner, dict) and "cache_control" in inner
+        for m in p["messages"] if isinstance(m["content"], list)
+        for b in m["content"] if isinstance(b, dict) and isinstance(b.get("content"), list)
+        for inner in b["content"]
+    )
+
+
+def test_breakpoints_nested_in_tool_result_are_counted_and_oldest_dropped():
+    nested = [{"type": "text", "text": f"r{i}", "cache_control": {"type": "ephemeral"}} for i in range(3)]
+    messages = [
+        {"role": "system", "content": "s" * 5000},
+        {"role": "user", "content": "find it"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "t1", "function": {"name": "a", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "t1", "content": nested},
+    ]
+    before = copy.deepcopy(messages)
+    p = llm_core._build_anthropic_payload("claude", messages, 0.0, 1000, stream=True, tools=_TOOLS)
+    # A nested marker does not suppress the conversation breakpoint: it lands on the last
+    # message's top-level tool_result block. The cap then counts system + tools + nested + that
+    # block's own marker (6) and strips oldest first; nested blocks precede the enclosing
+    # tool_result's own marker in prompt order, so the earliest nested markers go first.
+    assert _all_breakpoints(p) + _nested_breakpoints(p) == 4
+    assert "cache_control" in p["system"][0] and "cache_control" in p["tools"][-1]
+    result = p["messages"][-1]["content"][-1]
+    assert result["type"] == "tool_result" and "cache_control" in result
+    assert "cache_control" not in result["content"][0]
+    assert "cache_control" not in result["content"][1]
+    assert "cache_control" in result["content"][2]
+    assert messages == before
+
+
+def _tool_round(result_content):
+    return [
+        {"role": "system", "content": "s" * 5000},
+        {"role": "user", "content": "find it"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "t1", "function": {"name": "a", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "t1", "content": result_content},
+    ]
+
+
+def test_nested_marker_does_not_suppress_conversation_breakpoint_within_cap():
+    nested = [{"type": "text", "text": "r", "cache_control": {"type": "ephemeral"}}]
+    messages = _tool_round(nested)
+    p = llm_core._build_anthropic_payload("claude", messages, 0.0, 1000, stream=True, tools=_TOOLS)
+    result = p["messages"][-1]["content"][-1]
+    assert result["type"] == "tool_result" and "cache_control" in result
+    assert "cache_control" in result["content"][0]
+    assert _all_breakpoints(p) + _nested_breakpoints(p) == 4
+
+
+def test_cap_strips_older_message_first_then_nested_oldest():
+    nested = [{"type": "text", "text": f"r{i}", "cache_control": {"type": "ephemeral"}} for i in range(3)]
+    messages = _tool_round(nested)
+    messages[1] = {"role": "user", "content": [
+        {"type": "text", "text": "find it", "cache_control": {"type": "ephemeral"}}]}
+    before = copy.deepcopy(messages)
+    p = llm_core._build_anthropic_payload("claude", messages, 0.0, 1000, stream=True, tools=_TOOLS)
+    assert _all_breakpoints(p) + _nested_breakpoints(p) == 4
+    assert "cache_control" in p["system"][0] and "cache_control" in p["tools"][-1]
+    assert "cache_control" not in p["messages"][0]["content"][0]
+    result = p["messages"][-1]["content"][-1]
+    assert result["type"] == "tool_result" and "cache_control" not in result
+    assert "cache_control" not in result["content"][0]
+    assert all("cache_control" in b for b in result["content"][1:])
+    assert messages == before

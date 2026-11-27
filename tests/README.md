@@ -125,6 +125,15 @@ the run with a usage error rather than quietly testing a subset. If you change
 the shard count, change `DEFAULT_SHARD_COUNT` and the `ci.yml` matrix together;
 `tests/test_shards.py` fails when they drift apart.
 
+To run every shard the way CI does (Python 3.11, `CI=true`, all shards even
+after one fails, then the Playwright mobile layout checks), use
+`python3 scripts/ci_local.py --only python-tests`, or `--shard 2/4` for one
+shard. Like CI, it will not start pytest without working bubblewrap; pass
+`--without-bwrap` to run anyway and expect containment failures. The summary
+marks a pass with weaker coverage than CI as `PASS*` and says why, for example
+running as root. `tests/test_ci_local_harness.py` keeps the harness in step
+with the workflow files.
+
 ## Local pytest workers
 
 Install the application environment and parallel test tooling with
