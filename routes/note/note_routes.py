@@ -140,6 +140,31 @@ def _reminder_text_from_note(note: Note) -> tuple[str, str]:
 _scheduler_ref = None
 
 
+def _reminder_owner_is_admin(owner: str) -> bool:
+    """Whether reminders for `owner` may go to the install-wide
+    `reminder_email_to` address.
+
+    That setting is the admin's own address (hidden from non-admin settings
+    reads), so only admins and the single-user modes qualify. Mirrors
+    fire_reminder's `_is_admin_or_single_user` for callers that have no
+    request, such as the background note scanner: an empty owner is the
+    single-user / legacy ownerless path. Fails closed on a lookup error.
+    """
+    if not owner or owner == INTERNAL_TOOL_USER:
+        return True
+    try:
+        from src.auth_helpers import _auth_disabled
+        if _auth_disabled():
+            return True
+        from core.auth import AuthManager
+        auth_mgr = AuthManager()
+        if not auth_mgr.is_configured:
+            return True
+        return bool(auth_mgr.is_admin(owner))
+    except Exception:
+        return False
+
+
 async def dispatch_reminder(
     title: str,
     note_body: str,
@@ -147,6 +172,7 @@ async def dispatch_reminder(
     owner: str = "",
     queue_browser: bool = True,
     settings_override: dict | None = None,
+    owner_is_admin: bool | None = None,
 ) -> dict:
     """Fire a reminder via the configured channel (browser/email/ntfy/webhook).
 
@@ -156,6 +182,12 @@ async def dispatch_reminder(
         note_id: stable id (used as tag/dedupe in browser notifications)
         owner: the user this reminder belongs to — scopes SMTP config to
                their account so we don't cross-leak credentials
+        owner_is_admin: whether `owner` is an admin (or the install is in a
+               single-user mode). None looks it up from `owner`. A non-admin's
+               reminder email never goes to the install-wide
+               `reminder_email_to`; it goes to the owner's own mail account
+               address, or is skipped when they have none. Their ntfy and
+               webhook reminders are skipped: both channels are install-wide.
 
     Returns: {synthesis, email_sent, ntfy_sent}. Browser channel is wired via
     the in-memory notification queue picked up by the frontend poller, so
@@ -300,6 +332,12 @@ async def dispatch_reminder(
                 logger.warning(f"Reminder synthesis looked like an error, replacing: {_s[:120]!r}")
                 synthesis = _SYNTH_FAILED_TAG
 
+    # Every external channel is scoped by whether the owner is an admin: the
+    # install-wide email recipient, ntfy topic and webhook integration are
+    # the admin's own channels.
+    if owner_is_admin is None and channel in ("email", "ntfy", "webhook"):
+        owner_is_admin = _reminder_owner_is_admin(owner)
+
     email_sent = False
     email_error = ""
     if channel == "email":
@@ -335,7 +373,40 @@ async def dispatch_reminder(
                 except Exception as _fallback_error:
                     logger.debug(f"Reminder SMTP fallback lookup failed: {_fallback_error}")
             from_addr = (cfg.get("from_address") or cfg.get("smtp_user") or "").strip()
-            recipient = (settings.get("reminder_email_to") or "").strip() or from_addr
+            owns_account = False
+            if not owner_is_admin:
+                # Only an email-account row owned by this owner counts as their
+                # own address, so look it up by id AND owner rather than
+                # trusting cfg: `_get_email_config` can carry an account_id into
+                # its install-wide settings.json/env fallback and stamps that
+                # dict with the caller as `owner`.
+                own_from = ""
+                _own_acc_id = cfg.get("account_id")
+                if _own_acc_id and owner:
+                    from core.database import SessionLocal as _OwnSL, EmailAccount as _OwnEA
+                    _own_db = _OwnSL()
+                    try:
+                        _own_row = (
+                            _own_db.query(_OwnEA)
+                            .filter(_OwnEA.id == _own_acc_id, _OwnEA.owner == owner)
+                            .first()
+                        )
+                        if _own_row is not None:
+                            owns_account = True
+                            own_from = (
+                                _own_row.from_address or _own_row.imap_user
+                                or _own_row.smtp_user or ""
+                            ).strip()
+                    finally:
+                        _own_db.close()
+                # Never the install-wide `email_from`: only the owned row's.
+                from_addr = own_from
+            if owner_is_admin:
+                recipient = (settings.get("reminder_email_to") or "").strip() or from_addr
+            else:
+                # `reminder_email_to` is the admin's address: never send a
+                # non-admin's note there.
+                recipient = from_addr if owns_account else ""
             # Loud diagnostic so we can see WHY a reminder didn't send (the
             # previous "silently no-op when cfg has no smtp_host" was invisible).
             logger.info(
@@ -356,7 +427,14 @@ async def dispatch_reminder(
                 missing.append("from address")
             if not recipient:
                 missing.append("recipient")
-            if missing:
+            if not owner_is_admin and not owns_account:
+                email_error = "No email account of your own is set up for reminder emails"
+                logger.warning(
+                    "Reminder email skipped for note_id=%s owner=%r: "
+                    "non-admin owner has no email account of their own",
+                    note_id, owner,
+                )
+            elif missing:
                 email_error = "Missing " + ", ".join(missing)
                 logger.warning(
                     "Reminder email not sent for note_id=%s account=%r: %s",
@@ -395,12 +473,29 @@ async def dispatch_reminder(
                 await _aio.to_thread(_smtp_send)
                 email_sent = True
         except Exception as e:
-            email_error = str(e) or e.__class__.__name__
-            logger.warning(f"Reminder email send failed: {e}")
+            # SMTP errors can quote the recipient/sender address (e.g.
+            # SMTPRecipientsRefused), so neither the response nor the log
+            # carries the exception text.
+            email_error = "Reminder email could not be sent; see the server log"
+            logger.warning(
+                "Reminder email send failed for note_id=%s owner=%r: %s (smtp_code=%s)",
+                note_id, owner, e.__class__.__name__, getattr(e, "smtp_code", None),
+            )
 
+    # Neither the response nor the log of the webhook/ntfy branches carries
+    # the integration id, URL or topic: they describe the admin's channels.
     webhook_sent = False
     webhook_error = ""
-    if channel == "webhook":
+    if channel == "webhook" and not owner_is_admin:
+        # `reminder_webhook_integration_id` is install-wide (there is no
+        # per-user webhook): never post a non-admin's note to it.
+        webhook_error = "Webhook reminders are configured by the admin"
+        logger.info(
+            "Reminder webhook skipped for note_id=%s owner=%r: "
+            "install-wide channel, owner is not an admin",
+            note_id, owner,
+        )
+    elif channel == "webhook":
         try:
             import httpx
             import json as _wjson
@@ -421,7 +516,7 @@ async def dispatch_reminder(
                     None,
                 )
                 if not intg:
-                    webhook_error = f"Integration {intg_id!r} not found or missing base URL"
+                    webhook_error = "Selected webhook integration not found or missing base URL"
                 else:
                     # Fall back to a built-in default for known presets so
                     # users don't have to configure a template for standard
@@ -457,7 +552,13 @@ async def dispatch_reminder(
                         _block = _os.getenv("REMINDER_WEBHOOK_BLOCK_PRIVATE_IPS", "false").lower() == "true"
                         _ok, _reason = _chk(url, block_private=_block)
                         if not _ok:
-                            webhook_error = f"Webhook URL rejected: {_reason}"
+                            # The reason quotes the resolved address; log only
+                            # its category.
+                            webhook_error = "Webhook URL rejected by the outbound URL safety check"
+                            logger.warning(
+                                "Reminder webhook URL rejected for note_id=%s: %s",
+                                note_id, _reason.split(":", 1)[0],
+                            )
                         else:
                             async with httpx.AsyncClient(timeout=10.0) as client:
                                 resp = await client.post(url, content=rendered.encode(), headers=hdrs)
@@ -465,12 +566,25 @@ async def dispatch_reminder(
                                 if not webhook_sent:
                                     webhook_error = f"Webhook returned HTTP {resp.status_code}"
         except Exception as e:
-            webhook_error = str(e) or e.__class__.__name__
-            logger.warning(f"Reminder webhook send failed: {e}")
+            # httpx errors can quote the target URL.
+            webhook_error = "Reminder webhook could not be sent; see the server log"
+            logger.warning(
+                "Reminder webhook send failed for note_id=%s owner=%r: %s",
+                note_id, owner, e.__class__.__name__,
+            )
 
     ntfy_sent = False
     ntfy_error = ""
-    if channel == "ntfy":
+    if channel == "ntfy" and not owner_is_admin:
+        # `reminder_ntfy_topic` and the ntfy integration are install-wide
+        # (there is no per-user topic): never push a non-admin's note there.
+        ntfy_error = "Phone reminders are configured by the admin"
+        logger.info(
+            "Reminder ntfy skipped for note_id=%s owner=%r: "
+            "install-wide channel, owner is not an admin",
+            note_id, owner,
+        )
+    elif channel == "ntfy":
         try:
             from src.integrations import load_integrations
             import httpx
@@ -498,7 +612,13 @@ async def dispatch_reminder(
                 _block = _os.getenv("REMINDER_WEBHOOK_BLOCK_PRIVATE_IPS", "false").lower() == "true"
                 _ok, _reason = _chk(f"{base}/{topic}", block_private=_block)
                 if not _ok:
-                    ntfy_error = f"ntfy URL rejected: {_reason}"
+                    # The reason quotes the resolved address; log only its
+                    # category.
+                    ntfy_error = "ntfy URL rejected by the outbound URL safety check"
+                    logger.warning(
+                        "Reminder ntfy URL rejected for note_id=%s: %s",
+                        note_id, _reason.split(":", 1)[0],
+                    )
                 else:
                     async with httpx.AsyncClient(timeout=10.0) as client:
                         resp = await client.post(f"{base}/{topic}", content=ntfy_body, headers=hdrs)
@@ -508,8 +628,12 @@ async def dispatch_reminder(
             else:
                 ntfy_error = "No enabled ntfy integration"
         except Exception as e:
-            ntfy_error = str(e) or e.__class__.__name__
-            logger.warning(f"Reminder ntfy send failed: {e}")
+            # httpx errors can quote the target URL (and so the topic).
+            ntfy_error = "Reminder ntfy push could not be sent; see the server log"
+            logger.warning(
+                "Reminder ntfy send failed for note_id=%s owner=%r: %s",
+                note_id, owner, e.__class__.__name__,
+            )
 
     # In-app browser notification ALWAYS fires (regardless of channel). The
     # frontend polls `/api/tasks/notifications` and turns any entry with a
@@ -904,6 +1028,7 @@ def setup_note_routes(task_scheduler=None, upload_handler=None):
             owner=caller or "",
             queue_browser=False,
             settings_override=_override or None,
+            owner_is_admin=is_admin,
         )
 
     # --- REORDER NOTES ---

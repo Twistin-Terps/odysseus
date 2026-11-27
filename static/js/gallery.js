@@ -3376,11 +3376,17 @@ export function isGalleryOpen() {
 
 // ---- Utilities ----
 
+// HTML-escape for text AND quoted-attribute contexts: & < > " '.
+// (A textContent->innerHTML round trip left quotes raw, so a value placed
+// inside attribute="..." could close the attribute.)
 function _esc(str) {
   if (!str) return '';
-  const d = document.createElement('div');
-  d.textContent = str;
-  return d.innerHTML;
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function _humanSize(bytes) {

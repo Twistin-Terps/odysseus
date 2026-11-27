@@ -1142,10 +1142,17 @@ function _btn(label, onClick) {
   return b;
 }
 
+// HTML-escape for text AND quoted-attribute contexts: & < > " '.
+// (A textContent->innerHTML round trip left quotes raw, so a value placed
+// inside attribute="..." could close the attribute.) null/undefined -> ''
+// as the textContent setter did; other values are stringified (0 -> "0").
 function _esc(s) {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // Long-press a task card (mobile) to open its ⋮ actions menu. Hold 500ms;

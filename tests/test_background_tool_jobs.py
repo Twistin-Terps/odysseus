@@ -184,7 +184,7 @@ async def test_summary_makes_an_actual_model_request(monkeypatch):
         return httpx.Response(200, json={'choices': [{'message': {'content': 'Aster measured 17% improvement.'}}]})
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         monkeypatch.setattr(llm_core, '_get_http_client', lambda: client)
-        session = SimpleNamespace(id='summary-fixture', endpoint_url='http://summary-model.test/v1/chat/completions', model='fixture')
+        session = SimpleNamespace(id='summary-fixture', endpoint_url='https://api.openai.com/v1/chat/completions', model='fixture')
         result = await BackgroundToolJobs(is_busy=lambda sid: False)._summarize(session, {
             'job_id': 'rp-summary', 'query': 'Aster trial', 'report': 'Aster improved 17%.', 'sources': [], 'rounds': 2,
         })

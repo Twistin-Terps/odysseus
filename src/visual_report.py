@@ -54,6 +54,36 @@ _REPORT_ALLOWED_ATTRS.setdefault("span", set()).add("data-display")
 # Helpers
 # ---------------------------------------------------------------------------
 
+_URL_STRIP_CHARS = "".join(chr(c) for c in range(0x21))  # ASCII controls + space
+_URL_INNER_IGNORED_RE = re.compile(r"[\t\n\r]")
+
+
+def _safe_link_url(url) -> str:
+    """Return `url` cleaned for use as an href if its scheme is http/https, else "".
+
+    Source URLs come from stored web results and the report route allows
+    inline scripts, so javascript:/data:/vbscript: (and any other scheme) must
+    never become a clickable href. Browsers ignore leading/trailing controls
+    and spaces, and tabs/newlines anywhere in a URL, so do the same before
+    checking the scheme.
+    """
+    if not isinstance(url, str):
+        return ""
+    cleaned = _URL_INNER_IGNORED_RE.sub("", url.strip(_URL_STRIP_CHARS))
+    try:
+        parsed = urlparse(cleaned)
+        scheme = parsed.scheme.lower()
+        if scheme not in ("http", "https"):
+            return ""
+        # Host-less forms (https:/path, http:evil, https:) resolve against the
+        # page's own origin, so require a real host.
+        if not parsed.netloc or not parsed.hostname:
+            return ""
+    except ValueError:
+        return ""
+    return cleaned
+
+
 def _autolink_urls(md_text: str) -> str:
     """Convert bare URLs to markdown links before processing.
 
@@ -2967,8 +2997,13 @@ def generate_visual_report(
                 f'<span class="source-score"{meta_title}>{score}/100</span>'
                 if score is not None else ""
             )
+            safe_url = _safe_link_url(url)
+            link_open = (
+                f'<a href="{html.escape(safe_url)}" target="_blank" rel="noopener noreferrer">'
+                if safe_url else '<a>'
+            )
             items.append(
-                f'<a href="{html.escape(url)}" target="_blank" rel="noopener noreferrer">'
+                f'{link_open}'
                 f'<span class="snum">{i}.</span>'
                 f'<span class="source-copy"><span class="source-title">{title}</span>'
                 f'<span class="source-meta"><span>{html.escape(domain)}</span>{"".join(badges)}</span></span>'

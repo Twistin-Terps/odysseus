@@ -87,6 +87,8 @@ import bcrypt as _bcrypt
 from src.app_helpers import abs_join, serve_html_with_nonce
 from src.generated_images import GENERATED_IMAGE_HEADERS, resolve_generated_image_path
 from src.owner_identity import auth_disabled
+from src.rate_limiter import RateLimiter
+from src.upload_body_limit import UploadBodyLimitMiddleware
 from starlette.responses import RedirectResponse
 
 # ========= LOGGING =========
@@ -132,6 +134,13 @@ app = FastAPI(
     description="Comprehensive AI chat with memory, research, and multi-modal capabilities",
     version="1.0.0",
 )
+
+# ========= UPLOAD BODY CAP =========
+# Refuse an oversized upload body with 413 while it streams in, before FastAPI
+# spools the multipart parts to disk (src/upload_body_limit.py). Added first so
+# it is the innermost middleware: its 413 still passes through CORS, gzip and
+# the security headers on the way out.
+app.add_middleware(UploadBodyLimitMiddleware)
 
 # ========= CORS =========
 CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
@@ -376,6 +385,34 @@ if AUTH_ENABLED:
         app.state._token_cache = _token_cache
         app.state._token_cache_dirty = False
 
+    def _match_api_token(raw_token: str, candidates):
+        """Return ``(id, owner, scopes)`` of the cached token ``raw_token``
+        matches, or None. Each bcrypt check costs about a third of a second of
+        CPU, so callers run this in a worker thread, never on the event loop."""
+        raw = raw_token.encode()
+        for tid, thash, owner, scopes in candidates:
+            if _bcrypt.checkpw(raw, thash.encode()):
+                return tid, owner, scopes or []
+        return None
+
+    # Failed bearer verifications per (client host, token prefix). Behind
+    # cloudflared/nginx every request arrives from 127.0.0.1, so a per-IP key
+    # let anyone lock every integration out with a few junk headers. Only a
+    # bcrypt check that ran and matched no cached token counts: a prefix with
+    # no cached token costs no bcrypt and is never recorded, and a working
+    # token is never throttled by its own traffic.
+    _bearer_fail_limiter = RateLimiter(max_requests=10, window_seconds=60)
+
+    def _bearer_fail_key(client_ip: str, prefix: str) -> str:
+        return f"{client_ip}|{prefix}"
+
+    # A prefix with no cached token is answered only after about one bcrypt
+    # check's time (the cost noted at _match_api_token), plus jitter. An instant
+    # 401 there let anyone find live prefixes by timing and then lock them out.
+    # The wait is a sleep, so it costs no CPU, and it is still never counted.
+    _BEARER_MISS_DELAY_S = 0.3
+    _BEARER_MISS_JITTER_S = 0.05
+
     # Headers that prove a request was forwarded by a proxy/tunnel (cloudflared,
     # nginx, Caddy, Tailscale Funnel, …). cloudflared connects to the app FROM
     # 127.0.0.1, so without this check every tunneled request would look like
@@ -456,27 +493,51 @@ if AUTH_ENABLED:
             # --- Bearer token auth (API tokens for external integrations) ---
             auth_header = request.headers.get("authorization", "")
             if auth_header.startswith("Bearer ody_"):
+                client_ip = request.client.host if request.client else ""
                 raw_token = auth_header[7:]
-                # Sanity check: tokens are "ody_" + 43 chars of base64
+                # Sanity check: tokens are "ody_" + 43 chars of base64. A
+                # malformed token costs no bcrypt, so it is not counted.
                 if len(raw_token) < 12 or len(raw_token) > 100:
                     return JSONResponse(status_code=401, content={"error": "Invalid API token"})
                 prefix = raw_token[:8]
+                fail_key = _bearer_fail_key(client_ip, prefix)
+                verifying = False
                 try:
                     if app.state._token_cache_dirty:
                         async with _token_cache_lock:
                             if app.state._token_cache_dirty:
                                 await _asyncio.to_thread(_refresh_token_cache)
                     candidates = list(_token_cache.get(prefix, ()))
-                    matched_id = None
-                    matched_owner = None
-                    matched_scopes = []
-                    for tid, thash, owner, scopes in candidates:
-                        if _bcrypt.checkpw(raw_token.encode(), thash.encode()):
-                            matched_id = tid
-                            matched_owner = owner
-                            matched_scopes = scopes or []
-                            break
-                    if matched_id:
+                    if not candidates:
+                        # No token has this prefix: reject without bcrypt and
+                        # without recording a failure, so junk prefixes can
+                        # never trip the limiter for anyone. Answer no sooner
+                        # than a bcrypt check would, so timing does not reveal
+                        # which prefixes are live.
+                        await _asyncio.sleep(
+                            _BEARER_MISS_DELAY_S
+                            + secrets.SystemRandom().uniform(0, _BEARER_MISS_JITTER_S)
+                        )
+                        return JSONResponse(status_code=401, content={"error": "Invalid API token"})
+                    # Trade-off: once (client, prefix) is over the limit, even
+                    # the valid token with that prefix gets 429 until the
+                    # window passes. Verifying before the limit check would
+                    # spare it, but would hand an attacker who knows a live
+                    # prefix unbounded bcrypt CPU again. Tokens with any other
+                    # prefix are unaffected.
+                    if _bearer_fail_limiter.is_limited(fail_key):
+                        return JSONResponse(
+                            status_code=429,
+                            content={"error": "Too many failed API token attempts, try again later"},
+                        )
+                    verifying = True
+                    match = await _asyncio.to_thread(_match_api_token, raw_token, candidates)
+                    verifying = False
+                    if match is None:
+                        # bcrypt ran and matched no cached token.
+                        _bearer_fail_limiter.check(fail_key)
+                    else:
+                        matched_id, matched_owner, matched_scopes = match
                         # Update last_used_at off the hot path. Doing it
                         # inline used to keep the request open across an
                         # extra commit; do it fire-and-forget instead.
@@ -504,7 +565,13 @@ if AUTH_ENABLED:
                         return await call_next(request)
                 except Exception:
                     logger.warning("API token auth error", exc_info=False)
-                # Invalid bearer token — reject immediately
+                    if verifying:
+                        # bcrypt work was spent and nothing matched (e.g. a
+                        # corrupt stored hash). Count it, or a raising check
+                        # would be unlimited bcrypt CPU for this prefix.
+                        _bearer_fail_limiter.check(fail_key)
+                # Invalid bearer token — reject immediately. A failure was
+                # recorded above only when bcrypt ran without a match.
                 return JSONResponse(status_code=401, content={"error": "Invalid API token"})
 
             # --- Cookie-based session auth ---

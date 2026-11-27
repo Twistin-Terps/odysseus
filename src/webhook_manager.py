@@ -16,6 +16,7 @@ import httpcore
 import httpx
 
 from src.database import SessionLocal, Webhook
+from src.url_security import is_blocked_ip
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,10 @@ def _utcnow() -> datetime:
 
 
 def _ip_is_private(addr: ipaddress._BaseAddress) -> bool:
+    # The shared rule (RFC 6598 shared space, site-local, ISATAP, 6to4, ...)
+    # always applies; the checks below only ever add to it.
+    if is_blocked_ip(addr):
+        return True
     # If the address is IPv4-mapped IPv6, extract and evaluate the embedded IPv4
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped

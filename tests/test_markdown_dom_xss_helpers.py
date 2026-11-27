@@ -46,7 +46,7 @@ def test_email_rich_body_render_path_reuses_raw_html_sanitizer():
         "  // Mirror the rich body's plain text", 1
     )[0]
 
-    assert "export function sanitizeAllowedHtml(html)" in markdown_src
+    assert "export function sanitizeAllowedHtml(html, options)" in markdown_src
     assert "sanitizeAllowedHtml," in markdown_src
-    assert "markdownModule.sanitizeAllowedHtml(t)" in email_body_helper
+    assert "markdownModule.sanitizeAllowedHtml(t, { keepRemoteMedia: true })" in email_body_helper
     assert "return t;" not in email_body_helper

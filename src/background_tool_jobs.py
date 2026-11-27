@@ -95,6 +95,11 @@ class BackgroundToolJobs:
 
     async def _summarize(self, session, payload):
         from src.llm_core import llm_call_async
+        from src.session_endpoint_trust import UNTRUSTED_ENDPOINT_MESSAGE, uses_untrusted_session_url
+        # A token-supplied base_url stored on the session is only pinned by sync_chat;
+        # refuse it here (tick falls back to a notice) rather than call it.
+        if uses_untrusted_session_url(session.endpoint_url, session, getattr(session, 'owner', None)):
+            raise ValueError(UNTRUSTED_ENDPOINT_MESSAGE)
         headers = {}
         if self.session_manager:
             current = self.session_manager.get_session(session.id)
