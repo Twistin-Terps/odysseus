@@ -8,7 +8,8 @@ truncated or empty file. For password DBs (`auth.json`) and live state
 that's a data-loss event.
 
 `atomic_write_json` writes to a sibling tmp file, fsyncs, then `os.replace`s
-into place. On POSIX `os.replace` is atomic on the same filesystem.
+into place. On POSIX `os.replace` is atomic on the same filesystem. The tmp
+file is created owner-only (0o600), so the file it replaces is too.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import os
 import uuid
 import functools
 import threading
+import time
 from typing import Any, Optional
 
 
@@ -58,6 +60,29 @@ def store_transaction(path_factory):
     return decorate
 
 
+def _replace(tmp: str, path: str) -> None:
+    """``os.replace``, tolerating a concurrent reader on Windows.
+
+    Windows refuses to replace a file another handle has open (the stdlib
+    ``open`` does not share delete access), so a reader that happens to hold
+    the target open makes the rename fail with PermissionError. The reader
+    only holds it for the length of a read, so retry briefly. POSIX renames
+    over open files and never takes the retry path.
+    """
+    if os.name != "nt":
+        os.replace(tmp, path)
+        return
+    attempts = 40
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.005 * min(attempt + 1, 10))
+
+
 def atomic_write_json(path: str, data: Any, *, indent: Optional[int] = None) -> None:
     """Atomically persist `data` as JSON at `path`.
 
@@ -71,11 +96,20 @@ def atomic_write_json(path: str, data: Any, *, indent: Optional[int] = None) -> 
     tmp = f"{path}.tmp.{uuid.uuid4().hex}"
 
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        # Owner-only from the first byte: callers persist raw session tokens
+        # (sessions.json) and TOTP secrets/backup codes (auth.json), and a
+        # plain open() creates the file 0o666 & ~umask, i.e. world-readable
+        # 0o644 under the usual 022. os.replace keeps this inode's mode.
+        # O_EXCL: the name is fresh, so never reuse or follow an existing
+        # path. Windows ignores the bits beyond read-only; O_BINARY leaves
+        # newline translation to the text layer only, as open() does.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        fd = os.open(tmp, flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=indent)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        _replace(tmp, path)
     finally:
         # Directly unlink to avoid a check-then-act race condition.
         # Swallows FileNotFoundError (on success path) and other cleanup OSErrors.
@@ -96,7 +130,7 @@ def atomic_write_text(path: str, text: str) -> None:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        _replace(tmp, path)
     finally:
         # Directly unlink to avoid a check-then-act race condition.
         # Swallows FileNotFoundError (on success path) and other cleanup OSErrors.

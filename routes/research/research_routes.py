@@ -148,6 +148,12 @@ def _resolve_research_endpoint(sess, owner: Optional[str] = None) -> tuple:
         fallback_headers=sess.headers,
         owner=owner,
     )
+    # resolve_endpoint returns the session's stored URL verbatim when no
+    # research/utility endpoint is configured. A token-supplied URL that is not
+    # a configured endpoint must never be contacted from here.
+    from src.session_endpoint_trust import UNTRUSTED_ENDPOINT_MESSAGE, uses_untrusted_session_url
+    if uses_untrusted_session_url(url, sess, owner):
+        raise HTTPException(400, UNTRUSTED_ENDPOINT_MESSAGE)
     return url, model, headers
 
 

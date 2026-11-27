@@ -22,12 +22,16 @@ export const _TALON_ORIG_RE = /(?:^|\n)[\s>]*[-_=]{3,}\s*(?:Original\s+Message|F
 // a click for two bytes of saving.
 export const _SIG_BLOAT_MIN_CHARS = 200;
 
-// HTML-escape a string by round-tripping through a detached div. Cheap
-// and correct (handles all the entities that matter for innerHTML).
+// HTML-escape a string for text AND quoted-attribute contexts: & < > " '.
+// (The old textContent->innerHTML round trip left quotes raw, so email data
+// placed inside attribute="..." could close the attribute.)
 export function _esc(text) {
-  const div = document.createElement('div');
-  div.textContent = text || '';
-  return div.innerHTML;
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 const _EMAIL_SUMMARY_ERROR_MESSAGES = Object.freeze({
@@ -69,6 +73,22 @@ function _isDangerousUrl(value) {
 
 function _isDangerousSrcset(value) {
   return String(value || '').split(',').some(candidate => _isDangerousUrl(candidate));
+}
+
+// An absolute (or scheme-relative) http(s) URL in a legacy `background` /
+// `poster` attribute is fetched as soon as the body is inserted, bypassing the
+// click-to-load remote image flow. `http:host` and `\\host` are matched too:
+// the URL parser treats both like `//host` for http(s).
+function _isRemoteFetchUrl(value) {
+  return /^(?:https?:|[\\/]{2})/.test(_compactUrlSchemeValue(value));
+}
+
+// An inline style declaration that can make the browser fetch something on
+// render: url(), image-set() (which takes bare strings), or src(). Any
+// backslash (CSS escapes such as `u\72l(`) or comment (`/*`) drops the
+// declaration too, so obfuscated spellings never have to be decoded here.
+function _isFetchingCssDeclaration(compactDecl) {
+  return /url\(|image-set\(|src\(|\\|\/\*/.test(compactDecl);
 }
 
 // Escape + linkify URLs and email addresses. Returns innerHTML-safe markup.
@@ -184,10 +204,14 @@ export function _initials(s) {
 // inline tags in <mark> so they render legibly across themes.
 function _sanitizeHtmlOnce(html) {
   const doc = new DOMParser().parseFromString(html, 'text/html');
+  // Media elements and image inputs fetch their src on insertion, bypassing
+  // click-to-load: video/audio/source/track go entirely, input loses src.
   doc.querySelectorAll(
     'script, iframe, object, embed, form, style, link, ' +
-    'svg, math, base, meta, noscript, frame, frameset, applet, portal'
+    'svg, math, base, meta, noscript, frame, frameset, applet, portal, ' +
+    'video, audio, source, track'
   ).forEach(el => el.remove());
+  doc.querySelectorAll('input[src]').forEach(el => el.removeAttribute('src'));
 
   const URL_ATTRS = ['href', 'src', 'xlink:href', 'srcset', 'action', 'formaction', 'background', 'poster', 'data'];
 
@@ -208,6 +232,10 @@ function _sanitizeHtmlOnce(html) {
         el.removeAttribute(attr.name);
         continue;
       }
+      if ((name === 'background' || name === 'poster') && _isRemoteFetchUrl(attr.value)) {
+        el.removeAttribute(attr.name);
+        continue;
+      }
     }
     el.removeAttribute('color');
     const bgcolor = el.getAttribute('bgcolor');
@@ -223,6 +251,11 @@ function _sanitizeHtmlOnce(html) {
         if (!decl) return false;
         const lower = _compactUrlSchemeValue(decl);
         if (lower.includes('javascript:') || lower.includes('vbscript:') || lower.includes('data:') || lower.includes('expression(')) return false;
+        // Remote content stays blocked until the reader opts in: the email
+        // CSS only forces `background-image: none`, so an inline
+        // `background-image: url(...) !important`, list-style-image,
+        // border-image, cursor or content would still fetch on open.
+        if (_isFetchingCssDeclaration(lower)) return false;
         const prop = decl.split(':', 1)[0].trim().toLowerCase();
         return !STRIP_CSS_PROPS.includes(prop);
       });

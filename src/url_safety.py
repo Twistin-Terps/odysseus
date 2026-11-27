@@ -29,6 +29,8 @@ import socket
 from typing import Callable, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from src.url_security import is_blocked_ip
+
 ALLOWED_SCHEMES = ("http", "https")
 
 # RFC 6598 shared address space (carrier-grade NAT). It is not globally
@@ -84,6 +86,17 @@ def _default_resolver(host: str) -> List[str]:
 
 def _classify(ip: ipaddress._BaseAddress, *, block_private: bool) -> Optional[str]:
     """Return a rejection reason for an IP, or None if it is allowed."""
+    reason = _classify_own(ip, block_private=block_private)
+    # Strict mode also refuses everything the shared rule refuses (site-local,
+    # ISATAP, 6to4 relay, ...). The default mode deliberately allows private
+    # and loopback targets for local services, so it is left as it was.
+    if reason is None and block_private and is_blocked_ip(ip):
+        return f"disallowed address: {ip}"
+    return reason
+
+
+def _classify_own(ip: ipaddress._BaseAddress, *, block_private: bool) -> Optional[str]:
+    """This module's own rule; see _classify."""
     # IPv4-mapped IPv6 (e.g. ::ffff:169.254.169.254) — judge the embedded v4.
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped

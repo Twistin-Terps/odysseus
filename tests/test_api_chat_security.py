@@ -4,6 +4,7 @@ import sys
 import types
 from pathlib import Path
 
+import httpx
 import pytest
 
 
@@ -67,6 +68,7 @@ def _load_webhook_routes_for_test(monkeypatch):
     webhook_manager.WebhookManager = object
     webhook_manager.validate_webhook_url = lambda url: url
     webhook_manager.validate_events = lambda events: events
+    webhook_manager._PinnedAsyncTransport = lambda ip: httpx.AsyncBaseTransport()
 
     monkeypatch.setitem(sys.modules, "core", core_pkg)
     monkeypatch.setitem(sys.modules, "core.database", core_db)
@@ -120,7 +122,9 @@ class _Endpoint:
         created_at=1,
         base_url="https://api.example.com/v1",
         api_key=None,
+        id="ep-1",
     ):
+        self.id = id
         self.owner = owner
         self.is_enabled = is_enabled
         self.created_at = created_at
@@ -190,7 +194,7 @@ class _SessionManager:
         self.created = []
         self.save_calls = 0
 
-    def create_session(self, *, session_id, name, endpoint_url, model, owner):
+    def create_session(self, *, session_id, name, endpoint_url, model, owner, endpoint_id=None):
         session = _ChatSession(endpoint_url, model)
         self.created.append({
             "session_id": session_id,
@@ -198,6 +202,7 @@ class _SessionManager:
             "endpoint_url": endpoint_url,
             "model": model,
             "owner": owner,
+            "endpoint_id": endpoint_id,
             "session": session,
         })
         return session
@@ -235,7 +240,7 @@ def _install_sync_chat_stubs(monkeypatch):
             self.role = role
             self.content = content
 
-    async def _llm_call_async(endpoint_url, model, messages, headers=None, timeout=None):
+    async def _llm_call_async(endpoint_url, model, messages, headers=None, timeout=None, pinned_client=None):
         return "mocked response"
 
     endpoint_resolver = types.ModuleType("src.endpoint_resolver")
@@ -377,13 +382,13 @@ async def test_api_chat_fallback_trusts_configured_local_endpoint(monkeypatch):
     def _session_local():
         return db
 
-    def _validate_public_http_url(url, *, max_length=2048):
+    def _resolve_public_http_url(url, *, max_length=2048):
         calls.append(url)
         raise AssertionError("configured fallback endpoint should not be publicly validated")
 
     monkeypatch.setattr(webhook_routes, "ModelEndpoint", _ModelEndpoint)
     monkeypatch.setattr(webhook_routes, "SessionLocal", _session_local)
-    monkeypatch.setattr(webhook_routes, "validate_public_http_url", _validate_public_http_url)
+    monkeypatch.setattr(webhook_routes, "resolve_public_http_url", _resolve_public_http_url)
 
     session_manager = _SessionManager()
     sync_chat = _sync_chat_endpoint(webhook_routes, session_manager)

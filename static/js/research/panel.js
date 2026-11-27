@@ -1811,10 +1811,16 @@ async function _chatAboutResearch(researchId, btn) {
   }
 }
 
+// HTML-escape for text AND quoted-attribute contexts: & < > " '.
+// (A textContent->innerHTML round trip left quotes raw, so a value placed
+// inside attribute="..." could close the attribute.)
 function _esc(s) {
-  const d = document.createElement('div');
-  d.textContent = s || '';
-  return d.innerHTML;
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function _safeSourceHref(raw) {

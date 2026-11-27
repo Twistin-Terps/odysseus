@@ -60,20 +60,40 @@ is_broad_mount_root() {
     return 1
 }
 
+# Chown one path (not its contents) without following symlinks. This runs as
+# root, but /app is owned by the app user, so a path such as /app/.cache (or
+# its parent) could have been swapped for a symlink to /etc on a previous run.
+# Plain chown follows a final-component symlink and -h does not cover
+# symlinked parent directories, so skip the path if it or its parent is a link.
+# The recursive repairs below have no such check: they use find -execdir, so
+# chown runs inside the directory find actually opened and gets ./name with -h.
+# A parent directory renamed and replaced by a symlink after find listed the
+# file therefore cannot redirect the chown outside the tree.
+# GNU find refuses -execdir when PATH holds an empty or relative entry, and
+# with stderr discarded and `|| true` that would skip the repair silently, so
+# each find runs with a fixed absolute PATH.
+chown_path_no_follow() {
+    target="$1"
+    if [ -L "$target" ] || [ -L "${target%/*}" ]; then
+        echo "Skipping ownership repair for $target because it or its parent is a symlink" >&2
+        return 0
+    fi
+    chown -h "$PUID:$PGID" "$target" 2>/dev/null || true
+}
+
 repair_tree_ownership() {
     dir="$1"
     if [ -d "$dir" ]; then
-        find "$dir" -xdev -not -uid "$PUID" -print0 2>/dev/null \
-            | xargs -0 -r chown "$PUID:$PGID" 2>/dev/null || true
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin find "$dir" -xdev -not -uid "$PUID" \
+            -execdir chown -h "$PUID:$PGID" {} + 2>/dev/null || true
     fi
 }
 
 repair_app_tree_ownership() {
     if [ -d /app ]; then
-        find /app -xdev \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin find /app -xdev \
             \( -path /app/data -o -path /app/logs -o -path /app/.ssh -o -path /app/.cache -o -path /app/.local \) -prune \
-            -o -not -uid "$PUID" -print0 2>/dev/null \
-            | xargs -0 -r chown "$PUID:$PGID" 2>/dev/null || true
+            -o -not -uid "$PUID" -execdir chown -h "$PUID:$PGID" {} + 2>/dev/null || true
     fi
 }
 
@@ -86,7 +106,7 @@ repair_bind_mount_ownership() {
     mount_root="$(mount_root_for "$dir")"
     if is_broad_mount_root "$mount_root"; then
         echo "Skipping recursive ownership repair for $dir because it maps to broad host path $mount_root" >&2
-        chown "$PUID:$PGID" "$dir" 2>/dev/null || true
+        chown_path_no_follow "$dir"
         return
     fi
 
@@ -100,11 +120,11 @@ repair_app_tree_ownership
 # entrypoint runs. Repair only the parent directory itself so app-user caches
 # such as /app/.cache/vllm and /app/.cache/flashinfer can be created without
 # recursively walking the mounted model cache.
-chown "$PUID:$PGID" /app/.cache 2>/dev/null || true
+chown_path_no_follow /app/.cache
 # The Hugging Face cache can contain hundreds of gigabytes and is a nested
 # mount with its own ownership contract. Repair its mount root so new cache
 # entries are writable, but never traverse or rewrite existing model files.
-chown "$PUID:$PGID" /app/.cache/huggingface 2>/dev/null || true
+chown_path_no_follow /app/.cache/huggingface
 for dir in /app/data /app/logs /app/.ssh /app/.local; do
     repair_bind_mount_ownership "$dir"
 done

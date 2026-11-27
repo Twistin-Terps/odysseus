@@ -20,6 +20,7 @@ from core.database import ScheduledTask
 from routes.task.task_routes import TaskCreate
 
 _TMPDB = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_TMPDB.close()  # SQLite owns its connections; release the Windows file handle.
 _ENGINE = create_engine(
     f"sqlite:///{_TMPDB.name}",
     connect_args={"check_same_thread": False},
@@ -137,8 +138,13 @@ async def test_generated_task_name_turns_thinking_off(monkeypatch):
         return "Daily AI News"
 
     monkeypatch.setattr("src.llm_core.llm_call_async", fake_call)
+    monkeypatch.setattr("src.session_endpoint_trust.SessionLocal", _TS)
     db = _TS()
     try:
+        db.add(cdb.ModelEndpoint(
+            id="task-name-endpoint", owner="alice", name="local",
+            base_url="http://127.0.0.1:8081/v1", is_enabled=True,
+        ))
         db.add(cdb.Session(
             id="task-name-session", name="s", owner="alice",
             endpoint_url="http://127.0.0.1:8081/v1", model="gemma4-26b",

@@ -33,6 +33,8 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse, urlunparse
 
+from src.url_security import is_blocked_ip
+
 logger = logging.getLogger(__name__)
 
 # Pull window: 90 days back, 1 year forward. Keeps the REPORT cheap and
@@ -63,7 +65,11 @@ def _validate_caldav_address(addr: ipaddress._BaseAddress) -> None:
         or addr.is_reserved
     ):
         raise ValueError("CalDAV URL host is not allowed")
-    if addr.is_private and not _private_caldav_allowed():
+    if _private_caldav_allowed():
+        return
+    # Opt-in off: the shared rule (RFC 6598 shared space, site-local, ISATAP,
+    # 6to4, ...) also applies, so this guard is never weaker than it.
+    if addr.is_private or is_blocked_ip(addr):
         raise ValueError("Private CalDAV IPs require ODYSSEUS_ALLOW_PRIVATE_CALDAV=1")
 
 

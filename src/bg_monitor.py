@@ -180,6 +180,13 @@ async def _run_followup(rec: dict) -> FollowupResult:
             return FollowupResult.TERMINAL_UNFOLLOWABLE
     except (ValueError, TypeError, OSError, RuntimeError):
         return FollowupResult.TERMINAL_UNFOLLOWABLE
+    # The session's stored URL may be a token-supplied one that only sync_chat
+    # may use; never contact it from a background continuation.
+    from src.session_endpoint_trust import session_endpoint_is_trusted
+    if not session_endpoint_is_trusted(sess, getattr(sess, "owner", None)):
+        logger.info("bg-followup: session %s endpoint is not a configured endpoint; job %s not continued",
+                    sess.id, rec.get("id"))
+        return FollowupResult.TERMINAL_UNFOLLOWABLE
     context = sess.get_context_messages()
     context.append(_background_result_message(rec))
     authority = authority.restrict(disabled_tools=get_setting("disabled_tools", []) or ())

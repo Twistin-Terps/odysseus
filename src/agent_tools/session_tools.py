@@ -240,6 +240,10 @@ async def send_to_session(content: str, session_id: Optional[str] = None, owner:
             }
         context.append({"role": "user", "content": message})
 
+        from src.session_endpoint_trust import UNTRUSTED_ENDPOINT_MESSAGE, uses_untrusted_session_url
+        if uses_untrusted_session_url(sess.endpoint_url, sess, getattr(sess, "owner", None) or owner):
+            return {"error": UNTRUSTED_ENDPOINT_MESSAGE}
+
         response = await llm_call_async(
             sess.endpoint_url, sess.model, context,
             headers=sess.headers,

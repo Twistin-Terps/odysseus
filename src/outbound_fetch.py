@@ -18,11 +18,17 @@ import httpcore
 import httpx
 
 from src.constants import WEB_FETCH_HARD_MAX_BYTES, WEB_FETCH_SOFT_MAX_BYTES
+from src.url_security import is_blocked_ip
 
 
 _PRIVATE_NETWORKS = (
     ipaddress.ip_network("0.0.0.0/8"),
     ipaddress.ip_network("10.0.0.0/8"),
+    # RFC 6598 shared address space (carrier-grade NAT): Tailscale nodes and
+    # Alibaba Cloud's metadata endpoint (100.100.100.200) live here. CPython
+    # does not report it as is_private, so it must be listed explicitly, as
+    # url_security and url_safety already do.
+    ipaddress.ip_network("100.64.0.0/10"),
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("169.254.0.0/16"),
     ipaddress.ip_network("172.16.0.0/12"),
@@ -34,6 +40,10 @@ _PRIVATE_NETWORKS = (
 
 
 def _is_private_address(addr: ipaddress._BaseAddress) -> bool:
+    # The shared rule (site-local, ISATAP, 6to4, ...) always applies; the
+    # checks below only ever add to it.
+    if is_blocked_ip(addr):
+        return True
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
     return (

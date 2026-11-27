@@ -76,7 +76,8 @@ class _FakeSessionManager:
 class _FakeSession:
     id = "session-1"
     name = "Tool session"
-    endpoint_url = "http://example.test/v1"
+    # A built-in provider URL: compaction refuses an untrusted session URL.
+    endpoint_url = "https://api.openai.com/v1/chat/completions"
     model = "test-model"
     headers = {}
     owner = "session-owner"

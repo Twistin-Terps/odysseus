@@ -1957,6 +1957,11 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
     # back the cache-write premium.
     if tools or len(chat_messages) >= 3:
         _mark_last_message_cache_breakpoint(chat_messages)
+    # The 4-breakpoint cap applies to every request: caller-marked blocks can
+    # exceed it even on a short call that gets no conversation breakpoint.
+    reserved = sum("cache_control" in b for b in payload.get("system", []) if isinstance(b, dict))
+    reserved += sum("cache_control" in t for t in payload.get("tools", []))
+    _cap_message_cache_breakpoints(chat_messages, reserved)
     return payload
 
 
@@ -1965,18 +1970,71 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
 _ANTHROPIC_CACHEABLE_BLOCK_TYPES = {"text", "image", "document", "tool_use", "tool_result"}
 
 
+def _count_cache_breakpoints(blocks):
+    """Breakpoints in a content list, counting those on blocks nested in a
+    tool_result's own `content` list (the API counts those too)."""
+    n = 0
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "tool_result" and isinstance(b.get("content"), list):
+            n += _count_cache_breakpoints(b["content"])
+        n += "cache_control" in b
+    return n
+
+
+def _strip_cache_breakpoints(blocks, excess):
+    """Return (copy of `blocks` with up to `excess` breakpoints removed oldest
+    first, remaining excess). Blocks nested in a tool_result precede that
+    block's own breakpoint in the prompt, so they go first. Never mutates."""
+    blocks = list(blocks)
+    for i, b in enumerate(blocks):
+        if excess <= 0:
+            break
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "tool_result" and isinstance(b.get("content"), list) \
+                and _count_cache_breakpoints(b["content"]):
+            inner, excess = _strip_cache_breakpoints(b["content"], excess)
+            b = {**b, "content": inner}
+        if excess > 0 and "cache_control" in b:
+            b = {k: v for k, v in b.items() if k != "cache_control"}
+            excess -= 1
+        blocks[i] = b
+    return blocks, excess
+
+
+def _cap_message_cache_breakpoints(chat_messages, reserved=0):
+    """Keep the request within the API's 4 breakpoints. `reserved` is the
+    number of system/tool breakpoints already in the payload; those are kept,
+    and the oldest message breakpoints are stripped (on copies) to fit."""
+    excess = reserved - 4 + sum(
+        _count_cache_breakpoints(m["content"])
+        for m in chat_messages if isinstance(m.get("content"), list)
+    )
+    for mi, msg in enumerate(chat_messages):
+        if excess <= 0:
+            break
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        blocks, excess = _strip_cache_breakpoints(content, excess)
+        chat_messages[mi] = {**msg, "content": blocks}
+
+
 def _mark_last_message_cache_breakpoint(chat_messages):
     """Put one ephemeral cache breakpoint on the last cacheable block of the
     final message. Copies the message and block it changes, so the caller's
-    history never accumulates breakpoints across rounds (the API allows 4)."""
+    history never accumulates breakpoints across rounds (the API allows 4).
+    Adds none if the caller pre-marked any top-level message block."""
     if not chat_messages:
         return
-    for msg in chat_messages:
-        content = msg.get("content")
-        if isinstance(content, list) and any(
-            isinstance(b, dict) and "cache_control" in b for b in content
-        ):
-            return  # caller already placed its own message breakpoint
+    if any(
+        isinstance(msg.get("content"), list)
+        and any(isinstance(b, dict) and "cache_control" in b for b in msg["content"])
+        for msg in chat_messages
+    ):  # caller placed its own message breakpoints: add none
+        return
     last = chat_messages[-1]
     content = last.get("content")
     if isinstance(content, str):
@@ -2726,9 +2784,23 @@ async def llm_call_async(
     return_model_metadata: bool = False,
     thinking_mode: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    pinned_client: Optional[httpx.AsyncClient] = None,
 ) -> str | tuple[str, str]:
-    """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging."""
+    """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging.
+
+    ``pinned_client`` is for URLs an API token supplied: a client whose
+    transport connects only to the address that passed the SSRF check. When it
+    is set, every request goes through it, the context window comes from the
+    built-in table instead of probing the endpoint (that probe would connect by
+    hostname on its own), and upstream bodies are not echoed into errors.
+    """
     provider = _detect_provider(url)
+
+    def _context_length() -> int:
+        if pinned_client is not None:
+            from src.model_context import _lookup_known
+            return _lookup_known(model) or DEFAULT_CONTEXT
+        return get_context_length(url, model)
     messages_copy = _sanitize_llm_messages(messages)
 
     # Consolidate multiple system messages into one at the start.
@@ -2754,7 +2826,7 @@ async def llm_call_async(
 
             max_tokens = fit_output_token_budget(
                 max_tokens,
-                get_context_length(url, model),
+                _context_length(),
                 messages_copy,
             )
         except Exception:
@@ -2848,7 +2920,7 @@ async def llm_call_async(
             h.update(headers)
         payload = _build_ollama_payload(
             model, messages_copy, temperature, max_tokens,
-            stream=False, num_ctx=get_context_length(url, model),
+            stream=False, num_ctx=_context_length(),
         )
     else:
         target_url = _normalize_openai_chat_url(url)
@@ -2895,7 +2967,7 @@ async def llm_call_async(
         try:
             async with _local_model_slot(target_url, model, workload):
                 note_model_activity(target_url, model)
-                client = _get_http_client()
+                client = pinned_client if pinned_client is not None else _get_http_client()
                 r = await httpx_post_kimi_aware_async(client, target_url, h, json=payload, timeout=call_timeout)
             duration = time.time() - start
             if not r.is_success:
@@ -2949,7 +3021,8 @@ async def llm_call_async(
             except Exception:
                 raise _FallbackIneligibleHTTPException(
                     502,
-                    f"Unexpected schema from {target_url}: {str(data)[:400]}",
+                    f"Unexpected schema from {target_url}"
+                    + ("" if pinned_client is not None else f": {str(data)[:400]}"),
                 )
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             _cooled = _mark_host_dead(target_url)
