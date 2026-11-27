@@ -2286,6 +2286,11 @@ def _model_list_base(url: str) -> str:
     for suffix in ("/chat", "/tags", "/generate"):
         if base.endswith("/api" + suffix):
             base = base[: -len(suffix)].rstrip("/")
+    # Saved endpoints store ".../v1" or a bare host, while chat URLs built from
+    # them may or may not keep "/v1" (".../v1/messages" loses it above). Drop a
+    # trailing "/v1" on both sides so the configured cache is still found.
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")].rstrip("/")
     return base
 
 
